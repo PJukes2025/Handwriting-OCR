@@ -7,6 +7,20 @@ import io
 import json
 from datetime import datetime
 import pandas as pd
+import shutil
+
+# ✅ Auto-detect Tesseract binary
+TESSERACT_CMD = shutil.which("tesseract")
+if TESSERACT_CMD is None:
+    st.error(
+        "❌ Tesseract is not installed or not in PATH.\n\n"
+        "If running on Streamlit Cloud, add a `packages.txt` file with:\n"
+        "    tesseract-ocr\n"
+        "then restart the app."
+    )
+    st.stop()
+else:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 # Page config for mobile-friendly experience
 st.set_page_config(
