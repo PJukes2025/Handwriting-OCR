@@ -176,7 +176,6 @@ def apply_learned_corrections(text, image_name):
     # Journalism-specific corrections for margin notes
     journalism_fixes = {
         'MDSCOW': 'MOSCOW',
-        'RUSSI/\': 'RUSSIA',
         'POLIGH': 'POLISH',
         'UKRAIN': 'UKRAINE',
         'SKRIP/\L': 'SKRIPAL',
