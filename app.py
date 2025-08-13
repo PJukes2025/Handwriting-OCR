@@ -1,20 +1,21 @@
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import pytesseract
 import io
 import json
 from datetime import datetime
 import pandas as pd
 import shutil
+import math
 
-# ✅ Auto-detect Tesseract binary
+# =============== Tesseract autodetect (Cloud & local) ===============
 TESSERACT_CMD = shutil.which("tesseract")
 if TESSERACT_CMD is None:
     st.error(
         "❌ Tesseract is not installed or not in PATH.\n\n"
-        "If running on Streamlit Cloud, add a `packages.txt` file with:\n"
+        "On Streamlit Cloud, add a `packages.txt` with:\n"
         "    tesseract-ocr\n"
         "then restart the app."
     )
@@ -22,7 +23,14 @@ if TESSERACT_CMD is None:
 else:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
-# Page config for mobile-friendly experience
+# Optional: HEIC support if available
+try:
+    import pillow_heif  # requires pillow-heif + libheif1 on Cloud
+    pillow_heif.register_heif_opener()
+except Exception:
+    pass
+
+# =============== Page config & CSS ===============
 st.set_page_config(
     page_title="Journalist's OCR Tool",
     page_icon="📝",
@@ -30,41 +38,27 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for mobile responsiveness
 st.markdown("""
 <style>
-    .stFileUploader > div > div > div {
-        padding: 1rem;
-    }
-    .stImage > div {
-        text-align: center;
-    }
+    .stFileUploader > div > div > div { padding: 1rem; }
+    .stImage > div { text-align: center; }
     @media (max-width: 768px) {
         .main .block-container {
-            padding-top: 2rem;
-            padding-left: 1rem;
-            padding-right: 1rem;
+            padding-top: 2rem; padding-left: 1rem; padding-right: 1rem;
         }
     }
     .success-box {
-        padding: 1rem;
-        border-radius: 0.5rem;
-        background-color: #d4edda;
-        border: 1px solid #c3e6cb;
-        color: #155724;
-        margin: 1rem 0;
+        padding: 1rem; border-radius: 0.5rem; background-color: #d4edda;
+        border: 1px solid #c3e6cb; color: #155724; margin: 1rem 0;
     }
     .processing-stats {
-        background-color: #f8f9fa;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 4px solid #007bff;
-        margin: 1rem 0;
+        background-color: #f8f9fa; padding: 1rem; border-radius: 0.5rem;
+        border-left: 4px solid #007bff; margin: 1rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------------- Session State ----------------------
+# =============== Session State ===============
 if 'ocr_results' not in st.session_state:
     st.session_state.ocr_results = []   # list of dicts (each with image, text, original_text, etc.)
 if 'processing_history' not in st.session_state:
@@ -72,7 +66,54 @@ if 'processing_history' not in st.session_state:
 if 'user_corrections' not in st.session_state:
     st.session_state.user_corrections = {}
 
-# ---------------------- Image Preprocessing ----------------------
+# =============== Orientation helpers ===============
+def exif_transpose(img: Image.Image) -> Image.Image:
+    """Apply EXIF-based orientation (common for phone photos)."""
+    try:
+        return ImageOps.exif_transpose(img)
+    except Exception:
+        return img
+
+def auto_rotate_for_text(pil_image: Image.Image):
+    """
+    If strong vertical line dominance is detected (suggesting sideways text),
+    rotate 90° to make text horizontal. Returns (rotated_image, did_rotate: bool).
+    """
+    img = np.array(pil_image.convert("RGB"))
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+
+    # Probabilistic Hough to get line segments
+    H, W = gray.shape[:2]
+    min_len = max(30, min(H, W) // 6)
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=120,
+                            minLineLength=min_len, maxLineGap=20)
+
+    if lines is None or len(lines) < 6:
+        return pil_image, False
+
+    angles = []
+    for l in lines:
+        x1, y1, x2, y2 = l[0]
+        angle = math.degrees(math.atan2((y2 - y1), (x2 - x1)))
+        angle = (angle + 180) % 180  # map to [0, 180)
+        angles.append(angle)
+
+    # Count near-horizontal (0±20 or 180±20) vs near-vertical (90±20)
+    horiz = sum(1 for a in angles if a <= 20 or a >= 160)
+    vert  = sum(1 for a in angles if 70 <= a <= 110)
+    total = max(1, len(angles))
+
+    vert_ratio = vert / total
+    horiz_ratio = horiz / total
+
+    # If vertical lines dominate clearly, assume image is sideways → rotate 90° (CW)
+    if vert_ratio >= 0.6 and vert >= max(10, 3 * horiz):
+        return pil_image.rotate(90, expand=True), True
+
+    return pil_image, False
+
+# =============== Preprocessing & OCR ===============
 def preprocess_image(image, enhancement_level="medium"):
     """Advanced preprocessing for handwriting, optimized for margin notes"""
     img_array = np.array(image)
@@ -112,7 +153,6 @@ def preprocess_image(image, enhancement_level="medium"):
 
     return processed
 
-# ---------------------- OCR (Tesseract) ----------------------
 def extract_text_tesseract(image, enhancement_level="medium"):
     """Extract text using Tesseract OCR with multiple configurations for best results"""
     processed_img = preprocess_image(image, enhancement_level)
@@ -135,18 +175,15 @@ def extract_text_tesseract(image, enhancement_level="medium"):
             result = pytesseract.image_to_string(pil_processed, config=config).strip()
             config_name = ["general", "block", "word"][i]
             results[config_name] = result
-
-            # Choose the result with the most content (usually best)
             if len(result) > len(best_result):
                 best_result = result
                 best_config = config_name
-
         except Exception as e:
             results[f"config_{i}"] = f"Error: {e}"
 
     return best_result, results, processed_img, best_config
 
-# ---------------------- Learning Corrections ----------------------
+# =============== Learning Corrections ===============
 def learn_from_corrections(original_text, corrected_text, image_name):
     """Store user corrections to improve future recognition"""
     if original_text.strip() and corrected_text.strip() and original_text != corrected_text:
@@ -193,24 +230,18 @@ def apply_learned_corrections(text, image_name):
         'UKRA1NE': 'UKRAINE'
     }
 
-    # Apply common fixes first
     for wrong, right in common_fixes.items():
         corrected_text = corrected_text.replace(wrong, right)
-
-    # Apply journalism-specific fixes
     for wrong, right in journalism_fixes.items():
         corrected_text = corrected_text.replace(wrong, right)
-
-    # Apply stored corrections (simple string replacement for now)
     for correction in st.session_state.user_corrections.values():
         if correction['original'] in corrected_text:
             corrected_text = corrected_text.replace(correction['original'], correction['corrected'])
 
     return corrected_text
 
-# ---------------------- Helpers (export & display) ----------------------
+# =============== Helpers (export & display) ===============
 def results_to_dataframe(results_list):
-    """Convert results (list of dicts) to a DataFrame for export."""
     rows = []
     for r in results_list:
         rows.append({
@@ -229,7 +260,6 @@ def make_csv_bytes(df: pd.DataFrame) -> bytes:
     return buf.getvalue().encode("utf-8")
 
 def make_json_bytes(results_list) -> bytes:
-    # Serialize text-only fields for portability
     minimal = [
         {
             "filename": r.get("filename", ""),
@@ -243,27 +273,48 @@ def make_json_bytes(results_list) -> bytes:
     ]
     return json.dumps(minimal, ensure_ascii=False, indent=2).encode("utf-8")
 
+def reocr_single_result(res, enhancement_level):
+    """Re-run OCR for a single result dict after rotation or edits to image."""
+    best_text, all_configs, processed_img, best_config = extract_text_tesseract(res['image'], enhancement_level)
+    corrected_text = apply_learned_corrections(best_text, res['filename'])
+    res.update({
+        'text': corrected_text,
+        'original_text': best_text,
+        'all_configs': all_configs,
+        'processed_image': processed_img,
+        'best_config': best_config,
+        'engine': f'Tesseract ({best_config})',
+        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    })
+    return res
+
 def process_images(files, enhancement_level):
-    """Run OCR + apply learned corrections for a list of uploaded files or PIL Images."""
+    """Run EXIF transpose, auto-rotate, OCR + apply learned corrections."""
     processed_results = []
     for uploaded_file in files:
         try:
-            # Support both UploadedFile (from st.file_uploader) and raw PIL Images (for reruns)
-            image = uploaded_file if isinstance(uploaded_file, Image.Image) else Image.open(uploaded_file)
-            filename = getattr(uploaded_file, "name", "image.png")
+            # Support both UploadedFile and raw PIL
+            img = uploaded_file if isinstance(uploaded_file, Image.Image) else Image.open(uploaded_file)
 
-            best_text, all_configs, processed_img, best_config = extract_text_tesseract(image, enhancement_level)
+            # Normalize orientation first (EXIF)
+            img = exif_transpose(img)
+
+            # Auto-rotate if strong vertical lines
+            img_rot, did_rotate = auto_rotate_for_text(img)
+
+            filename = getattr(uploaded_file, "name", "image.png")
+            best_text, all_configs, processed_img, best_config = extract_text_tesseract(img_rot, enhancement_level)
             corrected_text = apply_learned_corrections(best_text, filename)
 
             result = {
-                'filename': filename,
+                'filename': filename + (" (rotated)" if did_rotate else ""),
                 'text': corrected_text,
                 'original_text': best_text,
                 'engine': f'Tesseract ({best_config})',
                 'all_configs': all_configs,
                 'best_config': best_config,
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'image': image,
+                'image': img_rot,              # store oriented original
                 'processed_image': processed_img
             }
             processed_results.append(result)
@@ -272,42 +323,64 @@ def process_images(files, enhancement_level):
             st.error(f"❌ Error processing {getattr(uploaded_file, 'name', 'image')}: {e}")
     return processed_results
 
-def display_results(results, show_processed_images=False, show_alternative_configs=False):
-    """Render results + edit & save UI."""
+def display_results(results, enhancement_level, show_processed_images=False, show_alternative_configs=False):
+    """Side-by-side image + text, with rotate & re-OCR and edit & save UI."""
     for idx, res in enumerate(results):
-        st.subheader(f"📝 {res['filename']}")
+        st.markdown("---")
+        st.write(f"**File:** {res['filename']}  •  **Engine:** {res['engine']}  •  **Time:** {res['timestamp']}")
 
-        # Show extracted text
-        st.text_area("Extracted Text", res['text'], height=150, key=f"view_text_{idx}")
+        col_img, col_txt = st.columns([1, 2])
 
-        # Optional images / configs
-        if show_processed_images:
-            st.image(res['processed_image'], caption="Processed Image", use_container_width=True)
+        with col_img:
+            # Rotate controls
+            rot_col1, rot_col2 = st.columns(2)
+            with rot_col1:
+                if st.button("⟲ Rotate 90°", key=f"rotl_{idx}"):
+                    res['image'] = res['image'].rotate(90, expand=True)  # CCW
+                    reocr_single_result(res, enhancement_level)
+                    st.session_state.ocr_results[idx] = res
+                    st.success("Rotated left and re-OCR'd.")
+            with rot_col2:
+                if st.button("⟳ Rotate 90°", key=f"rotr_{idx}"):
+                    res['image'] = res['image'].rotate(-90, expand=True)  # CW
+                    reocr_single_result(res, enhancement_level)
+                    st.session_state.ocr_results[idx] = res
+                    st.success("Rotated right and re-OCR'd.")
 
-        if show_alternative_configs:
-            with st.expander("Alternative OCR Configurations"):
-                for cfg, txt in res['all_configs'].items():
-                    st.write(f"[{cfg}]")
-                    st.code(txt if txt else "(no output)")
+            tabs = st.tabs(["Image", "Processed" if show_processed_images else " "])
+            with tabs[0]:
+                st.image(res['image'], caption="Image (auto/manual oriented)", use_container_width=True)
+            if show_processed_images:
+                with tabs[1]:
+                    st.image(res['processed_image'], caption="Processed (for OCR)", use_container_width=True)
 
-        # --- Edit & Save Correction UI ---
-        with st.expander("✏️ Edit & Save Correction"):
-            edited_text = st.text_area(
-                "Correct the text below and click Save to teach the tool.",
-                value=res['text'],
-                height=160,
-                key=f"edit_text_{idx}"
-            )
-            if st.button("Save Correction", key=f"save_corr_{idx}"):
-                # Learn mapping from original OCR to your corrected text
-                learn_from_corrections(res['original_text'], edited_text, res['filename'])
-                # Update the displayed text for this result (same dict stored in session)
-                res['text'] = edited_text
-                st.success("Saved! Future runs will apply this correction automatically.")
+        with col_txt:
+            st.text_area("Extracted Text", res['text'], height=220, key=f"view_text_{idx}")
 
-# ---------------------- UI (sidebar & controls) ----------------------
+            # --- Edit & Save Correction UI ---
+            with st.expander("✏️ Edit & Save Correction"):
+                edited_text = st.text_area(
+                    "Correct the text below and click Save to teach the tool.",
+                    value=res['text'],
+                    height=180,
+                    key=f"edit_text_{idx}"
+                )
+                save_cols = st.columns(2)
+                with save_cols[0]:
+                    if st.button("Save Correction", key=f"save_corr_{idx}"):
+                        learn_from_corrections(res['original_text'], edited_text, res['filename'])
+                        res['text'] = edited_text
+                        st.session_state.ocr_results[idx] = res
+                        st.success("Saved! Future runs will apply this correction automatically.")
+                with save_cols[1]:
+                    if st.button("Re-OCR This Image", key=f"reocr_{idx}"):
+                        reocr_single_result(res, enhancement_level)
+                        st.session_state.ocr_results[idx] = res
+                        st.success("Re-OCR complete for this image.")
+
+# =============== UI (sidebar & controls) ===============
 st.title("📝 Journalist's Handwriting OCR Tool")
-st.markdown("*Mobile-friendly batch OCR with learning capabilities - Tesseract Edition*")
+st.markdown("*Mobile-friendly batch OCR with learning capabilities — Tesseract Edition*")
 
 st.sidebar.header("Settings")
 enhancement_level = st.sidebar.selectbox(
@@ -318,12 +391,12 @@ enhancement_level = st.sidebar.selectbox(
 )
 
 batch_mode = st.sidebar.checkbox("Batch Processing Mode", value=True)
-show_processed_images = st.sidebar.checkbox("Show Processed Images", value=False)
-show_alternative_configs = st.sidebar.checkbox("Show Alternative OCR Configs", value=False)
+show_processed_images = st.sidebar.checkbox("Show Processed Images (tab)", value=False)
+show_alternative_configs = st.sidebar.checkbox("Show Alternative OCR Configs (in expander)", value=False)
 
-st.info("🚀 **Fast & Reliable**: This version uses Tesseract OCR for instant processing without downloads. Based on our handwriting analysis, expect 80-90% accuracy on your neat notes!")
+st.info("🚀 **Fast & Reliable**: This version uses Tesseract OCR for instant processing without downloads. Based on our handwriting analysis, expect 80–90% accuracy on neat notes.")
 
-# ---------------------- File upload ----------------------
+# =============== File upload ===============
 st.header("📤 Upload Images")
 if batch_mode:
     uploaded_files = st.file_uploader(
@@ -339,11 +412,16 @@ else:
     )]
 
 uploaded_files = [f for f in uploaded_files if f is not None]
-
 if uploaded_files:
     st.success(f"📁 {len(uploaded_files)} file(s) uploaded successfully!")
 
-# ---------------------- Process button ----------------------
+# =============== Process button ===============
+def results_to_download_blobs(results):
+    df = results_to_dataframe(results)
+    csv_bytes = make_csv_bytes(df)
+    json_bytes = make_json_bytes(results)
+    return df, csv_bytes, json_bytes
+
 if st.button("🔍 Process All Images", type="primary"):
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -360,61 +438,34 @@ if st.button("🔍 Process All Images", type="primary"):
     st.success("✅ Processing complete!")
     status_text.text("All files processed.")
 
-    # Display results
-    display_results(results, show_processed_images, show_alternative_configs)
+    # Display results (side-by-side, with rotate and re-OCR)
+    display_results(results, enhancement_level, show_processed_images, show_alternative_configs)
 
-    # ---- Download buttons for this run ----
+    # ---- Downloads for this run ----
     st.markdown("### ⬇️ Download This Run")
-    df_run = results_to_dataframe(results)
-    csv_bytes_run = make_csv_bytes(df_run)
-    json_bytes_run = make_json_bytes(results)
+    _, csv_bytes_run, json_bytes_run = results_to_download_blobs(results)
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    st.download_button("Download CSV (this run)", data=csv_bytes_run, file_name=f"ocr_results_{ts}.csv", mime="text/csv")
+    st.download_button("Download JSON (this run)", data=json_bytes_run, file_name=f"ocr_results_{ts}.json", mime="application/json")
 
-    st.download_button(
-        label="Download CSV (this run)",
-        data=csv_bytes_run,
-        file_name=f"ocr_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv"
-    )
-    st.download_button(
-        label="Download JSON (this run)",
-        data=json_bytes_run,
-        file_name=f"ocr_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-        mime="application/json"
-    )
-
-# ---------------------- Re-run with corrections applied ----------------------
+# =============== Re-run with corrections applied (all) ===============
 if st.session_state.ocr_results:
     st.markdown("---")
     st.subheader("🔁 Re-run with Corrections Applied")
-    st.caption("This will re-OCR the stored images using current settings and apply your learned corrections.")
+    st.caption("Re-OCR all stored images using current settings and apply learned corrections.")
     if st.button("Re-run Now"):
-        # Use images already in session state
         images_for_rerun = [r['image'] for r in st.session_state.ocr_results]
-
-        # Reprocess (fresh OCR + apply current corrections)
         rerun_results = process_images(images_for_rerun, enhancement_level)
-
-        # Replace session results with the new outputs
         st.session_state.ocr_results = rerun_results
-
         st.success("🔁 Re-run complete! Results updated below.")
-        display_results(rerun_results, show_processed_images, show_alternative_configs)
+        display_results(rerun_results, enhancement_level, show_processed_images, show_alternative_configs)
 
     # ---- Sidebar exports for all-time session results ----
     st.sidebar.markdown("### ⬇️ Export All Results (Session)")
     df_all = results_to_dataframe(st.session_state.ocr_results)
     csv_bytes_all = make_csv_bytes(df_all)
     json_bytes_all = make_json_bytes(st.session_state.ocr_results)
+    ts_all = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-    st.sidebar.download_button(
-        label="Download CSV (session)",
-        data=csv_bytes_all,
-        file_name=f"ocr_results_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv"
-    )
-    st.sidebar.download_button(
-        label="Download JSON (session)",
-        data=json_bytes_all,
-        file_name=f"ocr_results_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-        mime="application/json"
-    )
+    st.sidebar.download_button("Download CSV (session)", data=csv_bytes_all, file_name=f"ocr_results_session_{ts_all}.csv", mime="text/csv")
+    st.sidebar.download_button("Download JSON (session)", data=json_bytes_all, file_name=f"ocr_results_session_{ts_all}.json", mime="application/json")
