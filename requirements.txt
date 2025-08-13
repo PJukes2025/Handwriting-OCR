@@ -2,7 +2,6 @@ streamlit
 opencv-python-headless
 pillow
 pytesseract
-easyocr
 pandas
 numpy
-pillow-heif  # enables HEIC image reading
+pillow-heif
