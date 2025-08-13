@@ -252,7 +252,7 @@ if st.button("🔍 Process All Images", type="primary"):
         st.subheader(f"📝 {res['filename']}")
         st.text_area("Extracted Text", res['text'], height=150)
         if show_processed_images:
-            st.image(res['processed_image'], caption="Processed Image", use_column_width=True)
+            st.image(res['processed_image'], caption="Processed Image", use_container_width=True)
         if show_alternative_configs:
             with st.expander("Alternative OCR Configurations"):
                 for cfg, txt in res['all_configs'].items():
