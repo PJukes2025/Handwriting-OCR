@@ -46,6 +46,9 @@ def corr_get_all():
 def corr_set_all(new_dict):
     STORE[SID]["corrections"] = new_dict
 
+def corr_override_keys():
+    return sorted([k for k, v in corr_get_all().items() if isinstance(v, dict) and "corrected" in v])
+
 def corr_save(image_key: str, original_text: str, corrected_text: str):
     """
     Save a correction only in the server-side store (no session_state dependency).
@@ -88,9 +91,6 @@ def corr_override_for(image_key: str):
 def corr_history_for(image_key: str):
     return corr_get_all().get(f"{image_key}::history", [])
 
-def corr_override_keys():
-    return sorted([k for k, v in corr_get_all().items() if isinstance(v, dict) and "corrected" in v])
-
 # ======================= Minimal session state (results only) =======================
 if "ocr_results" not in st.session_state:
     st.session_state.ocr_results = []  # list of result dicts
@@ -123,6 +123,13 @@ if st.sidebar.button("🔄 Refresh now"):
     st.rerun()
 st.sidebar.caption(f"Cookie-less SID: `{SID}`")
 
+# Demo button to prove the store works regardless of OCR/results
+if st.sidebar.button("🧪 Force Add Demo Correction"):
+    demo_key = "DEMO_IMAGE__abc123"
+    corr_save(demo_key, "orig demo", "corrected demo")
+    st.sidebar.success(f"Added demo correction under key: {demo_key}")
+    st.rerun()
+
 if debug_mode:
     st.sidebar.write("Python:", platform.python_version())
     st.sidebar.write("OS:", platform.platform())
@@ -140,6 +147,12 @@ if debug_mode:
         st.sidebar.image(test_img, caption="Self-test image", use_container_width=True)
     except Exception as e:
         st.sidebar.error(f"OCR self-test failed: {e}")
+
+st.sidebar.markdown("**Saved keys:**")
+if corr_override_keys():
+    st.sidebar.code("\n".join(corr_override_keys()))
+else:
+    st.sidebar.caption("(no override keys yet)")
 
 if st.sidebar.checkbox("Show raw corrections (debug)"):
     st.sidebar.json(corr_get_all())
@@ -354,7 +367,7 @@ def reprocess_existing_results(enhancement_level, lang):
             st.error(f"❌ Error reprocessing {res.get('filename','image')}: {e}")
     return new_results
 
-# ======================= UI: per-image display (form submit saves to STORE) =======================
+# ======================= UI: per-image display (form submit saves to STORE & updates immediately) =======================
 def display_results(results, enhancement_level, lang, show_processed=False, show_alts=False, debug=False):
     for idx, res in enumerate(results):
         st.markdown("---")
@@ -386,7 +399,12 @@ def display_results(results, enhancement_level, lang, show_processed=False, show
                     st.image(res['processed_image'], caption="Processed (for OCR)", use_container_width=True)
 
         with col_txt:
-            st.text_area("Extracted Text", res['text'], height=220, key=f"view_text_{res['storage_key']}")
+            st.text_area(
+                "Extracted Text",
+                st.session_state.get(f"view_text_{res['storage_key']}", res['text']),
+                height=220,
+                key=f"view_text_{res['storage_key']}"
+            )
 
             if show_alts or debug:
                 with st.expander("Alternative OCR Configurations (raw output)"):
@@ -397,15 +415,21 @@ def display_results(results, enhancement_level, lang, show_processed=False, show
             with st.form(key=f"corr_form_{res['storage_key']}"):
                 edited_text = st.text_area(
                     "Correct the text below and press Submit.",
-                    value=res['text'],
+                    value=st.session_state.get(f"edit_text_{res['storage_key']}", res['text']),
                     height=180,
                     key=f"edit_text_{res['storage_key']}"
                 )
                 submitted = st.form_submit_button("💾 Submit Correction")
                 if submitted:
-                    # ✅ Correct order: image_key, original_text, corrected_text
+                    # Save to server-side store
                     corr_save(res['storage_key'], res['original_text'], edited_text)
-                    st.success("Saved correction for this image.")
+
+                    # Update visible text immediately
+                    res['text'] = edited_text
+                    st.session_state.ocr_results[idx] = res
+                    st.session_state[f"view_text_{res['storage_key']}"] = edited_text
+
+                    st.success("Saved correction and applied it immediately.")
                     st.rerun()
 
 # ======================= Header & Upload =======================
@@ -508,7 +532,6 @@ else:
         m1, m2, m3 = st.columns(3)
         with m1:
             if st.button("Update Override", key="mgr_update"):
-                # Append to history + update override in STORE
                 corr_save(selected_key, ov.get('original',''), new_corr)
                 st.success("Override updated.")
                 st.rerun()
