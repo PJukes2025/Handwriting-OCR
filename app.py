@@ -11,7 +11,7 @@ import pandas as pd
 # Page config for mobile-friendly experience
 
 st.set_page_config(
-page_title=“Journalist’s OCR Tool”,
+page_title="Journalist's OCR Tool",
 page_icon=“📝”,
 layout=“wide”,
 initial_sidebar_state=“expanded”
