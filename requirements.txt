@@ -5,3 +5,4 @@ pytesseract
 easyocr
 pandas
 numpy
+pillow-heif  # enables HEIC image reading
