@@ -1,5 +1,5 @@
 # app.py
-import os, io, json, time, tempfile, hashlib
+import os, io, json, time, tempfile, hashlib, platform, shutil
 from datetime import datetime
 
 import streamlit as st
@@ -7,6 +7,48 @@ import numpy as np
 import cv2
 from PIL import Image, ImageOps
 import pytesseract
+
+# ========== Tesseract auto-detection ==========
+def auto_configure_tesseract():
+    """
+    Find the Tesseract executable across macOS, Linux, and Windows.
+    If found, set pytesseract.pytesseract.tesseract_cmd and return the path.
+    Otherwise return None.
+    """
+    candidates = []
+
+    # 1) Anything already on PATH
+    on_path = shutil.which("tesseract")
+    if on_path:
+        candidates.append(on_path)
+
+    # 2) Common install locations by OS
+    system = platform.system()
+    if system == "Windows":
+        candidates += [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        ]
+    elif system == "Darwin":  # macOS
+        candidates += [
+            "/opt/homebrew/bin/tesseract",   # Apple Silicon Homebrew
+            "/usr/local/bin/tesseract",      # Intel Homebrew
+        ]
+    else:  # Linux and others
+        candidates += [
+            "/usr/bin/tesseract",
+            "/usr/local/bin/tesseract",
+            "/snap/bin/tesseract",
+        ]
+
+    for p in candidates:
+        if p and os.path.exists(p):
+            pytesseract.pytesseract.tesseract_cmd = p
+            return p
+    return None
+
+# Call it once at startup
+_TESS_PATH = auto_configure_tesseract()
 
 # ========== Paths ==========
 DATA_DIR = "ocr_data"
@@ -216,6 +258,18 @@ rebuild_user_words()
 
 # Sidebar
 st.sidebar.header("Settings")
+
+# Tesseract status in sidebar
+if _TESS_PATH:
+    st.sidebar.caption(f"✅ Tesseract detected: {_TESS_PATH}")
+else:
+    st.sidebar.warning(
+        "Tesseract not found. Install it and restart the app.\n\n"
+        "macOS: brew install tesseract\n"
+        "Ubuntu/Debian: sudo apt install tesseract-ocr\n"
+        "Windows: Install from UB Mannheim builds and ensure it’s on PATH."
+    )
+
 enhancement_level = st.sidebar.selectbox("Enhancement Level", ["light","medium","aggressive"], index=1)
 
 st.sidebar.markdown("### 🧠 Learning Status")
