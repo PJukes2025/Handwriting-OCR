@@ -601,6 +601,3 @@ else:
         else:
             for i, h in enumerate(reversed(hist), start=1):
                 ts = h.get('timestamp','')
-                corr = h.get('corrected','')
-                st.write(f"**{i}.** {ts} — corrected →")
-                st.code(corr if corr else "(empty)")
