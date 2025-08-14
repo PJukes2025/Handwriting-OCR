@@ -74,9 +74,8 @@ def learn_from_correction(original, corrected):
                     st.session_state.learned_patterns[orig_word]["count"] += 1
                     st.session_state.learned_patterns[orig_word]["replacement"] = corr_word
 
-    # Character-level patterns for single substitutions
+    # Character-level patterns for single substitutions (example)
     if abs(len(original) - len(corrected)) <= 1:
-        # Example: common OCR error patterns
         if "or" in original and "a" in corrected:
             pattern = "or"
             if pattern not in st.session_state.learned_patterns:
@@ -276,46 +275,46 @@ if st.session_state.ocr_results:
         st.markdown("---")
         st.subheader(f"📄 {result['filename']}")
 
+        # Two-column layout: image (left), OCR preview (right)
         col1, col2 = st.columns([1, 2])
 
         with col1:
             st.image(result['image'], caption="Original", use_container_width=True)
 
         with col2:
-            # Show current result
             st.text_area(
                 "Current OCR Result:",
                 value=result['text'],
-                height=100,
+                height=150,  # taller preview box
                 disabled=True,
                 key=f"current_{i}"
             )
 
-            # Learning form
-            with st.form(f"learn_{i}"):
-                st.write("**Correct any mistakes and submit to improve future OCR:**")
+        # Full-width correction area placed UNDER the two columns
+        with st.form(f"learn_{i}"):
+            st.write("**Correct any mistakes and submit to improve future OCR:**")
 
-                corrected_text = st.text_area(
-                    "Make corrections here:",
-                    value=result['text'],
-                    height=100,
-                    key=f"correct_{i}"
-                )
+            corrected_text = st.text_area(
+                "Corrected Text:",
+                value=result['text'],
+                height=300,   # larger editing area
+                key=f"correct_{i}"
+            )
 
-                submitted = st.form_submit_button("💾 Save Correction & Learn")
+            submitted = st.form_submit_button("💾 Save Correction & Learn")
 
-                if submitted:
-                    if save_correction(
-                        result['image_key'], result['original_text'], corrected_text
-                    ):
-                        # Update the result
-                        result['text'] = corrected_text
-                        st.session_state.ocr_results[i] = result
+            if submitted:
+                if save_correction(
+                    result['image_key'], result['original_text'], corrected_text
+                ):
+                    # Update the result
+                    result['text'] = corrected_text
+                    st.session_state.ocr_results[i] = result
 
-                        st.success("✅ Correction saved and learned! Future OCR will be improved.")
-                        st.rerun()
-                    else:
-                        st.info("No changes detected.")
+                    st.success("✅ Correction saved and learned! Future OCR will be improved.")
+                    st.rerun()
+                else:
+                    st.info("No changes detected.")
 
 # Export section
 if st.session_state.ocr_results:
