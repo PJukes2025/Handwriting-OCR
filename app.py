@@ -8,7 +8,7 @@ import cv2
 from PIL import Image, ImageOps
 import pytesseract
 
-# ========= Streamlit base config & upload size (adjust as needed) =========
+# ========= Streamlit base config & upload size =========
 st.set_page_config(page_title="Journalist's OCR Tool", page_icon="📝", layout="wide")
 st.set_option("server.maxUploadSize", 1024)  # MB
 
@@ -288,6 +288,7 @@ TRAIN_SCRIPT = textwrap.dedent("""\
         encodings = ["utf-8-sig","utf-8","utf-16","latin-1"]
         delims = [",",";","\\t","|"]
         raw = None
+        used = "utf-8"
         for enc in encodings:
             try:
                 with open(path,"r",encoding=enc,newline="") as f: raw = f.read(); used=enc; break
@@ -321,7 +322,7 @@ TRAIN_SCRIPT = textwrap.dedent("""\
                 parse_with(d)
                 if pairs: break
         if not pairs: raise RuntimeError("No labeled items parsed from CSV.")
-        print(f"[labels] parsed {len(pairs)} from {path}")
+        print(f"[labels] parsed {len(pairs)} from {path} using enc={used}")
         return pairs
 
     class LineDataset(Dataset):
@@ -477,7 +478,6 @@ crnn_ready = False
 if use_crnn:
     try:
         import importlib.util, torch, torchvision
-        # Ensure trainer script exists so we can import the CRNN class definition
         ensure_trainer_script()
         spec = importlib.util.spec_from_file_location("train_crnn", TRAIN_SCRIPT_PATH)
         mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
@@ -664,7 +664,8 @@ with st.expander("Open Trainer", expanded=False):
             missing = []
             for path in ["dataset/train/images", "dataset/train/labels.csv",
                          "dataset/val/images",   "dataset/val/labels.csv"]:
-                if not os.path.exists(path): missing.append(path)
+                if not os.path.exists(path):
+                    missing.append(path)
             if missing:
                 st.error("Your ZIP is missing:\n" + "\n".join(f"- {p}" for p in missing))
         except Exception as e:
@@ -695,6 +696,9 @@ with st.expander("Open Trainer", expanded=False):
                                            file_name=os.path.basename(MODEL_PATH), mime="application/octet-stream")
                 except Exception:
                     pass
+        except Exception as e:
+            st.error(f"Training error: {e}")
+            st.info("Tip: Ensure `torch` and `torchvision` are installed in this environment.")
 
 # Corrections manager
 if st.session_state.corrections:
