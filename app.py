@@ -76,7 +76,7 @@ def learn_from_correction(original, corrected):
 
     # Character-level patterns for single substitutions
     if abs(len(original) - len(corrected)) <= 1:
-        # Look for common OCR error patterns
+        # Example: common OCR error patterns
         if "or" in original and "a" in corrected:
             pattern = "or"
             if pattern not in st.session_state.learned_patterns:
@@ -113,8 +113,10 @@ def apply_learned_corrections(text, image_key):
         corrected_text = corrected_text.replace(wrong, right)
 
     # Apply learned patterns (sort by count - most frequent first)
-    sorted_patterns = sorted(st.session_state.learned_patterns.items(),
-                             key=lambda x: -x[1]["count"])
+    sorted_patterns = sorted(
+        st.session_state.learned_patterns.items(),
+        key=lambda x: -x[1]["count"]
+    )
 
     for pattern, info in sorted_patterns:
         replacement = info["replacement"]
@@ -134,17 +136,23 @@ def preprocess_image(image, enhancement_level="medium"):
     denoised = cv2.fastNlMeansDenoising(gray)
 
     if enhancement_level == "light":
-        processed = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        processed = cv2.threshold(
+            denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )[1]
     elif enhancement_level == "medium":
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(denoised)
-        processed = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        processed = cv2.threshold(
+            enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )[1]
     else:  # aggressive
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(6, 6))
         enhanced = clahe.apply(denoised)
         kernel = np.ones((2, 2), np.uint8)
         processed = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, kernel)
-        processed = cv2.threshold(processed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        processed = cv2.threshold(
+            processed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )[1]
 
     return processed
 
@@ -164,7 +172,9 @@ def extract_text(image, enhancement_level="medium"):
 
     for i, config in enumerate(configs):
         try:
-            result = pytesseract.image_to_string(pil_processed, config=config).strip()
+            result = pytesseract.image_to_string(
+                pil_processed, config=config
+            ).strip()
             config_name = ["general", "block", "word"][i]
 
             if len(result) > len(best_result):
@@ -192,8 +202,10 @@ st.sidebar.metric("Learned Patterns", num_patterns)
 
 if st.session_state.learned_patterns:
     st.sidebar.markdown("**Top Learned Patterns:**")
-    sorted_patterns = sorted(st.session_state.learned_patterns.items(),
-                             key=lambda x: -x[1]["count"])[:5]
+    sorted_patterns = sorted(
+        st.session_state.learned_patterns.items(),
+        key=lambda x: -x[1]["count"]
+    )[:5]
     for pattern, info in sorted_patterns:
         count = info["count"]
         replacement = info["replacement"]
@@ -226,10 +238,14 @@ if uploaded_files:
                 image_key = make_image_key(uploaded_file.name, image)
 
                 # Extract text
-                original_text, processed_img, config = extract_text(image, enhancement_level)
+                original_text, processed_img, config = extract_text(
+                    image, enhancement_level
+                )
 
                 # Apply learned corrections
-                corrected_text = apply_learned_corrections(original_text, image_key)
+                corrected_text = apply_learned_corrections(
+                    original_text, image_key
+                )
 
                 # Store result
                 result = {
@@ -289,7 +305,9 @@ if st.session_state.ocr_results:
                 submitted = st.form_submit_button("💾 Save Correction & Learn")
 
                 if submitted:
-                    if save_correction(result['image_key'], result['original_text'], corrected_text):
+                    if save_correction(
+                        result['image_key'], result['original_text'], corrected_text
+                    ):
                         # Update the result
                         result['text'] = corrected_text
                         st.session_state.ocr_results[i] = result
@@ -331,7 +349,7 @@ if st.session_state.corrections:
 
             st.caption(f"Saved: {correction['timestamp']}")
 
-            if st.button(f"🗑️ Delete", key=f"del_{image_key}"):
+            if st.button("🗑️ Delete", key=f"del_{image_key}"):
                 del st.session_state.corrections[image_key]
                 st.rerun()
 
