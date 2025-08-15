@@ -5,10 +5,10 @@ from datetime import datetime
 import streamlit as st
 import numpy as np
 import cv2
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageDraw
 import pytesseract
 
-# ========= Streamlit base config & upload size =========
+# ========= Streamlit base config =========
 st.set_page_config(page_title="Journalist's OCR Tool", page_icon="📝", layout="wide")
 
 # ========= Tesseract auto-detection =========
@@ -159,19 +159,44 @@ def apply_learned_corrections(text, image_key):
             corrected_text = corrected_text.replace(pat, info["replacement"])
     return corrected_text
 
-# ========= Orientation helpers =========
+# ========= Orientation helpers (updated) =========
 def rotate_image(pil_img: Image.Image, mode: str) -> Image.Image:
     """Rotate according to user selection."""
     if mode == "None":
         return pil_img
-    if mode == "Auto (landscape→portrait)":
-        return pil_img.rotate(90, expand=True) if pil_img.width > pil_img.height else pil_img
+
+    if mode == "Auto (keep text horizontal)":
+        # 1) Try Tesseract OSD to get rotation suggestion
+        try:
+            osd = pytesseract.image_to_osd(pil_img)
+            m = re.search(r"Rotate:\s+(\d+)", osd)
+            if m:
+                angle = int(m.group(1)) % 360
+                # If text is vertical (90/270), rotate to nearest horizontal
+                if angle in (90, 270):
+                    return pil_img.rotate(90 if angle == 90 else -90, expand=True)
+                elif angle == 180:
+                    return pil_img.rotate(180, expand=True)
+                else:
+                    return pil_img  # already horizontal
+        except Exception:
+            pass
+        # 2) Fallback: ensure width >= height
+        if pil_img.width < pil_img.height:
+            return pil_img.rotate(90, expand=True)
+        return pil_img
+
     if mode == "90° CW":
         return pil_img.rotate(-90, expand=True)
     if mode == "90° CCW":
         return pil_img.rotate(90, expand=True)
     if mode == "180°":
         return pil_img.rotate(180, expand=True)
+
+    # Back-compat (old name)
+    if mode == "Auto (landscape→portrait)":
+        return pil_img.rotate(90, expand=True) if pil_img.width > pil_img.height else pil_img
+
     return pil_img
 
 # ========= Image preprocessing & OCR =========
@@ -217,18 +242,23 @@ def extract_text_tesseract(image, enhancement_level="medium"):
             continue
     return best, processed, best_cfg
 
-# ========= Handwriting line segmentation (for CRNN) =========
-def segment_lines(pil_img, min_line_height=12, gap_thresh=6):
+# ========= Line segmentation with boxes (for previews) =========
+def segment_lines_with_boxes(pil_img, min_line_height=12, gap_thresh=6):
     """
-    Split a page into line crops using horizontal projection.
-    Returns a list of PIL images (one per line) in top→bottom order.
+    Returns:
+      crops: [PIL.Image], one per detected line (grayscale)
+      boxes: list of (x0, y0, x1, y1) in the coordinate system of pil_img
     """
     img = np.array(pil_img.convert("L"))
+    h, w = img.shape[:2]
+
+    # Robust binarization
     bw = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
                                cv2.THRESH_BINARY_INV, 25, 15)
     proj = bw.sum(axis=1)
+
+    # Find vertical runs with ink
     lines = []
-    h = img.shape[0]
     in_run = False
     start = 0
     for y in range(h):
@@ -243,6 +273,8 @@ def segment_lines(pil_img, min_line_height=12, gap_thresh=6):
         end = h
         if end - start >= min_line_height:
             lines.append((start, end))
+
+    # Merge close lines
     merged = []
     for s, e in lines:
         if not merged: merged.append([s, e]); continue
@@ -251,18 +283,32 @@ def segment_lines(pil_img, min_line_height=12, gap_thresh=6):
             merged[-1][1] = e
         else:
             merged.append([s, e])
-    crops = []
+
+    crops, boxes = [], []
     for s, e in merged:
         pad = 3
         s2 = max(0, s - pad); e2 = min(h, e + pad)
-        line = img[s2:e2, :]
-        col_proj = (255 - line).sum(axis=0)
+        strip = img[s2:e2, :]
+        # compute left/right ink extent
+        col_proj = (255 - strip).sum(axis=0)
         xs = np.where(col_proj > 0)[0]
-        if xs.size == 0: continue
+        if xs.size == 0: 
+            continue
         x0, x1 = xs[0], xs[-1] + 1
-        line = line[:, x0:x1]
+        line = strip[:, x0:x1]
         crops.append(Image.fromarray(line))
-    return crops
+        boxes.append((int(x0), int(s2), int(x1), int(e2)))
+    return crops, boxes
+
+def draw_boxes_on_image(pil_img, boxes, width=3):
+    """Return a copy of pil_img with red rectangles drawn for each (x0,y0,x1,y1)."""
+    overlay = pil_img.convert("RGB").copy()
+    draw = ImageDraw.Draw(overlay)
+    for (x0, y0, x1, y1) in boxes:
+        # red rectangle with thickness
+        for t in range(width):
+            draw.rectangle([x0 - t, y0 - t, x1 + t, y1 + t], outline=(255, 0, 0))
+    return overlay
 
 # ========= Persistence =========
 def persist_all():
@@ -457,12 +503,15 @@ else:
 
 enhancement_level = st.sidebar.selectbox("Enhancement Level", ["light","medium","aggressive"], index=1)
 
-# Orientation control
+# Orientation control (updated default)
 orientation_mode = st.sidebar.selectbox(
     "Orientation",
-    ["Auto (landscape→portrait)", "None", "90° CW", "90° CCW", "180°"],
+    ["Auto (keep text horizontal)", "None", "90° CW", "90° CCW", "180°"],
     index=0
 )
+
+# Show line boxes toggle
+show_line_boxes = st.sidebar.toggle("Show line boxes", value=True)
 
 # CRNN toggle appears only when model exists
 model_exists = os.path.exists(MODEL_PATH)
@@ -565,9 +614,28 @@ if imp_pat:
     except Exception as e:
         st.sidebar.error(f"Restore failed: {e}")
 
+# ========= OCR engine dispatch =========
+def run_ocr_on_image(pil_image):
+    """Run the currently-selected OCR engine on a PIL image and return (raw_text, processed_img, cfg, boxes, overlay_img)."""
+    if use_crnn and crnn_ready:
+        crops, boxes = segment_lines_with_boxes(pil_image)
+        lines = crops or [pil_image]
+        recognized = []
+        for ln in lines:
+            txt = recognize_line(ln)
+            recognized.append(txt.strip())
+        raw_text = "\n".join([t for t in recognized if t])
+        proc_img = preprocess_image(pil_image, enhancement_level)  # for display
+        cfg = "crnn-lines"
+        overlay = draw_boxes_on_image(pil_image, boxes) if show_line_boxes and boxes else None
+        return raw_text, proc_img, cfg, boxes, overlay
+    else:
+        raw_text, proc_img, cfg = extract_text_tesseract(pil_image, enhancement_level)
+        return raw_text, proc_img, cfg, [], None
+
 # ========= Main =========
 st.title("📝 Journalist's OCR Tool")
-st.markdown("*Handwriting-first OCR — CRNN per-line + learned corrections; rotate pages when needed.*")
+st.markdown("*Handwriting-first OCR — CRNN per-line + learned corrections; orientation keeps lines horizontal. Line boxes preview enabled.*")
 
 uploaded_files = st.file_uploader("Upload Images", type=["jpg","jpeg","png"], accept_multiple_files=True)
 if uploaded_files:
@@ -578,23 +646,13 @@ if uploaded_files:
             try:
                 image = Image.open(uf)
                 image = ImageOps.exif_transpose(image)         # respect camera EXIF
-                image = rotate_image(image, orientation_mode)  # apply orientation option
-                key = make_image_key(uf.name, image)
+                baseline = rotate_image(image, orientation_mode)  # apply global orientation option
 
-                if use_crnn and crnn_ready:
-                    # Segment to lines and recognize with CRNN
-                    lines = segment_lines(image) or [image]
-                    recognized = []
-                    for ln in lines:
-                        txt = recognize_line(ln)
-                        recognized.append(txt.strip())
-                    raw_text = "\n".join([t for t in recognized if t])
-                    proc_img = preprocess_image(image, enhancement_level)  # for display
-                    cfg = "crnn-lines"
-                else:
-                    raw_text, proc_img, cfg = extract_text_tesseract(image, enhancement_level)
+                key = make_image_key(uf.name, baseline)
 
+                raw_text, proc_img, cfg, boxes, overlay = run_ocr_on_image(baseline)
                 fixed = apply_learned_corrections(raw_text, key)
+
                 st.session_state.ocr_results.append({
                     "filename": uf.name,
                     "image_key": key,
@@ -602,23 +660,108 @@ if uploaded_files:
                     "text": fixed,
                     "config": cfg,
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "image": image,
+                    "baseline_image": baseline,   # for reset
+                    "image": baseline,            # current (rotatable) image
                     "processed_image": proc_img,
+                    "line_boxes": boxes,
+                    "overlay_image": overlay  # may be None if Tesseract path or toggle off
                 })
             except Exception as e:
                 st.error(f"Error processing {uf.name}: {e}")
             progress.progress((i+1)/len(uploaded_files))
         st.success("✅ Processing complete!")
 
-# Results & learning
+# Results & learning (with per-image rotate controls + overlays)
 if st.session_state.ocr_results:
     st.header("📋 Results & Learning")
     for i, r in enumerate(st.session_state.ocr_results):
         st.markdown("---")
         st.subheader(f"📄 {r['filename']}")
+
+        # Per-image rotate controls
+        bcol1, bcol2, bcol3, bcol4, bcol5 = st.columns([1,1,1,1,3])
+        with bcol1:
+            if st.button("↩︎ 90° CCW", key=f"rot_ccw_{i}"):
+                try:
+                    new_img = r["image"].rotate(90, expand=True)
+                    raw_text, proc_img, cfg, boxes, overlay = run_ocr_on_image(new_img)
+                    r.update({
+                        "image": new_img,
+                        "original_text": raw_text,
+                        "text": apply_learned_corrections(raw_text, r["image_key"]),
+                        "config": cfg,
+                        "processed_image": proc_img,
+                        "line_boxes": boxes,
+                        "overlay_image": overlay
+                    })
+                    st.session_state.ocr_results[i] = r
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Rotate CCW failed: {e}")
+        with bcol2:
+            if st.button("↪︎ 90° CW", key=f"rot_cw_{i}"):
+                try:
+                    new_img = r["image"].rotate(-90, expand=True)
+                    raw_text, proc_img, cfg, boxes, overlay = run_ocr_on_image(new_img)
+                    r.update({
+                        "image": new_img,
+                        "original_text": raw_text,
+                        "text": apply_learned_corrections(raw_text, r["image_key"]),
+                        "config": cfg,
+                        "processed_image": proc_img,
+                        "line_boxes": boxes,
+                        "overlay_image": overlay
+                    })
+                    st.session_state.ocr_results[i] = r
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Rotate CW failed: {e}")
+        with bcol3:
+            if st.button("⟲ 180°", key=f"rot_180_{i}"):
+                try:
+                    new_img = r["image"].rotate(180, expand=True)
+                    raw_text, proc_img, cfg, boxes, overlay = run_ocr_on_image(new_img)
+                    r.update({
+                        "image": new_img,
+                        "original_text": raw_text,
+                        "text": apply_learned_corrections(raw_text, r["image_key"]),
+                        "config": cfg,
+                        "processed_image": proc_img,
+                        "line_boxes": boxes,
+                        "overlay_image": overlay
+                    })
+                    st.session_state.ocr_results[i] = r
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Rotate 180 failed: {e}")
+        with bcol4:
+            if st.button("Reset to Auto", key=f"rot_reset_{i}"):
+                try:
+                    new_img = rotate_image(r["baseline_image"], "Auto (keep text horizontal)")
+                    raw_text, proc_img, cfg, boxes, overlay = run_ocr_on_image(new_img)
+                    r.update({
+                        "image": new_img,
+                        "original_text": raw_text,
+                        "text": apply_learned_corrections(raw_text, r["image_key"]),
+                        "config": cfg,
+                        "processed_image": proc_img,
+                        "line_boxes": boxes,
+                        "overlay_image": overlay
+                    })
+                    st.session_state.ocr_results[i] = r
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Reset failed: {e}")
+        with bcol5:
+            st.caption("Rotate this image and re-run OCR instantly.")
+
+        # Display with overlay option
         col1, col2 = st.columns([1, 2])
         with col1:
-            st.image(r["image"], caption="Original (after orientation)", use_container_width=True)
+            if show_line_boxes and r.get("overlay_image") is not None:
+                st.image(r["overlay_image"], caption="Detected line boxes", use_container_width=True)
+            else:
+                st.image(r["image"], caption="Current image", use_container_width=True)
         with col2:
             st.text_area("Current OCR Result:", value=r["text"], height=180, disabled=True, key=f"cur_{i}")
         with st.form(f"learn_{i}"):
@@ -721,4 +864,4 @@ if st.sidebar.checkbox("Show Debug Info"):
     st.write("**Number of Results:**", len(st.session_state.ocr_results))
 
 st.markdown("---")
-st.markdown("*💡 Tip: Use 'Auto (landscape→portrait)' if photos are sideways. Train CRNN on more lines for steady gains.*")
+st.markdown("*💡 Tip: Toggle 'Show line boxes' to visualize what the model will read. Use per-image rotate buttons for quick fixes, then save corrections to keep improving results.*")
