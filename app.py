@@ -863,5 +863,39 @@ if st.sidebar.checkbox("Show Debug Info"):
     st.write("**Learned Patterns:**", st.session_state.learned_patterns)
     st.write("**Number of Results:**", len(st.session_state.ocr_results))
 
+# ========= Export ZIP of CRNN Dataset =========
+import os
+from pathlib import Path
+import zipfile
+
+st.markdown("### 📦 Download Prepared Dataset")
+
+zip_path = Path("handwriting_dataset.zip")
+dataset_root = Path("dataset")
+
+def create_and_download_zip():
+    try:
+        with zipfile.ZipFile(zip_path, "w") as zipf:
+            for folder, _, files in os.walk(dataset_root):
+                for file in files:
+                    file_path = Path(folder) / file
+                    arcname = file_path.relative_to(dataset_root.parent)
+                    zipf.write(file_path, arcname=arcname)
+        with open(zip_path, "rb") as f:
+            st.download_button(
+                label="⬇️ Download Handwriting Dataset (ZIP)",
+                data=f.read(),
+                file_name=zip_path.name,
+                mime="application/zip"
+            )
+        zip_path.unlink(missing_ok=True)  # Delete after download
+    except Exception as e:
+        st.error(f"ZIP packaging failed: {e}")
+
+if dataset_root.exists() and any(dataset_root.rglob("*")):
+    create_and_download_zip()
+else:
+    st.info("No dataset found yet. Upload or generate one first.")
+
 st.markdown("---")
 st.markdown("*💡 Tip: Toggle 'Show line boxes' to visualize what the model will read. Use per-image rotate buttons for quick fixes, then save corrections to keep improving results.*")
