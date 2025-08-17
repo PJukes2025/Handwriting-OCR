@@ -38,7 +38,7 @@ _TESS_PATH = auto_configure_tesseract()
 
 # ========= Paths =========
 DATA_DIR         = "ocr_data"
-MODELS_DIR       = "models"  # new: central place for downloaded/pasted/uploaded models
+MODELS_DIR       = "models"  # central place for downloaded/pasted/uploaded models
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 CORRECTIONS_PATH = os.path.join(DATA_DIR, "corrections.json")
@@ -47,7 +47,7 @@ USER_WORDS_PATH  = os.path.join(DATA_DIR, "user_words.txt")
 
 # Default model filename; may be replaced by sidebar selection
 DEFAULT_MODEL_FILENAME = "crnn_handwriting.pt"
-DEFAULT_MODEL_PATH = os.path.join(".", DEFAULT_MODEL_FILENAME)
+DEFAULT_MODEL_PATH     = os.path.join(".", DEFAULT_MODEL_FILENAME)
 
 # ========= Robust JSON (“Jason”) layer =========
 SCHEMA_VERSION = 1
@@ -133,7 +133,6 @@ def sanitize_learned_patterns():
             cleaned[k] = {"replacement": replacement, "count": max(0, count), "examples": examples}
         elif isinstance(v, str):
             cleaned[k] = {"replacement": v, "count": 1, "examples": []}
-        # else drop invalid silently
     st.session_state.learned_patterns = cleaned
 
 def learn_from_correction(original, corrected):
@@ -312,7 +311,7 @@ def segment_lines_with_boxes(pil_img, min_line_height=12, gap_thresh=6):
         strip = img[s2:e2, :]
         col_proj = (255 - strip).sum(axis=0)
         xs = np.where(col_proj > 0)[0]
-        if xs.size == 0: 
+        if xs.size == 0:
             continue
         x0, x1 = xs[0], xs[-1] + 1
         line = strip[:, x0:x1]
@@ -531,11 +530,35 @@ def fetch_model_if_needed(url, out_path, expected_sha256=None):
     if need:
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         tmp = out_path + ".tmp"
-        urllib.request.urlretrieve(url, tmp)  # direct download
+        urllib.request.urlretrieve(url, tmp)
         if expected_sha256 and _sha256(tmp) != expected_sha256:
             os.remove(tmp)
             raise RuntimeError("Downloaded model hash mismatch")
         os.replace(tmp, out_path)
+    return out_path
+
+def fetch_model_zip_if_needed(url, out_path, expected_sha256=None):
+    """
+    Download a ZIP containing a .pt and extract the first .pt to out_path.
+    """
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    tmp_zip = out_path + ".zip.tmp"
+    urllib.request.urlretrieve(url, tmp_zip)
+    if expected_sha256:
+        if _sha256(tmp_zip) != expected_sha256:
+            os.remove(tmp_zip)
+            raise RuntimeError("Downloaded ZIP hash mismatch")
+    with zipfile.ZipFile(tmp_zip) as zf:
+        pt_members = [m for m in zf.namelist() if m.lower().endswith(".pt")]
+        if not pt_members:
+            os.remove(tmp_zip)
+            raise RuntimeError("ZIP does not contain a .pt file")
+        member = pt_members[0]
+        tmp_pt = out_path + ".tmp"
+        with zf.open(member) as src, open(tmp_pt, "wb") as dst:
+            dst.write(src.read())
+        os.replace(tmp_pt, out_path)
+    os.remove(tmp_zip)
     return out_path
 
 # ========= Sidebar =========
@@ -562,23 +585,21 @@ orientation_mode = st.sidebar.selectbox(
 
 show_line_boxes = st.sidebar.toggle("Show line boxes", value=True)
 
-# ===== NEW: Model source & persistence options =====
+# ===== Model source & persistence options =====
 st.sidebar.markdown("### Model source")
 model_choice = st.sidebar.selectbox(
     "Load CRNN model from",
-    ["Local file(s) in repo", "Remote URL via Secrets", "Paste a URL", "Upload (ephemeral)"],
-    index=0
+    ["Local file(s) in repo", "Remote URLs via Secrets (multiple)", "Remote URL via Secrets (single)", "Paste a URL", "Upload (ephemeral)"],
+    index=1  # default to Secrets multiple for your case
 )
 
 LOCAL_MODEL_CANDIDATES = []
-# include models/ and project root *.pt
 LOCAL_MODEL_CANDIDATES += sorted(glob.glob(os.path.join(MODELS_DIR, "*.pt")))
 LOCAL_MODEL_CANDIDATES += sorted(glob.glob("*.pt"))
 
-selected_local = None
-remote_loaded_error = None
-MODEL_PATH = DEFAULT_MODEL_PATH  # will be overwritten per choice
+MODEL_PATH = DEFAULT_MODEL_PATH
 model_exists = False
+remote_loaded_error = None
 
 if model_choice == "Local file(s) in repo":
     if not LOCAL_MODEL_CANDIDATES and os.path.exists(DEFAULT_MODEL_PATH):
@@ -593,15 +614,44 @@ if model_choice == "Local file(s) in repo":
         st.sidebar.info("No .pt files found in repo. Add via Git LFS or use a remote URL.")
         model_exists = False
 
-elif model_choice == "Remote URL via Secrets":
-    st.sidebar.caption("Define in Secrets (App → Settings → Secrets):")
-    st.sidebar.code('''[model]\nurl = "https://host/path/to/model.pt"\nsha256 = "optional_hex"''', language="toml")
+elif model_choice == "Remote URLs via Secrets (multiple)":
+    models_map = st.secrets.get("models", {})
+    shas_map   = st.secrets.get("models_sha256", {})
+    if not models_map:
+        st.sidebar.info("Define in Secrets:\n\n[models]\nname1=\"https://...pt\"\nname2=\"https://...pt\"")
+        model_exists = False
+    else:
+        key = st.sidebar.selectbox("Select model", sorted(models_map.keys()))
+        url = models_map.get(key, "")
+        sha = None
+        # allow matching checksum by same key if provided
+        if isinstance(shas_map, dict):
+            sha = shas_map.get(key)
+        MODEL_PATH = os.path.join(MODELS_DIR, f"{key}.pt")
+        try:
+            if url:
+                if url.lower().endswith(".zip"):
+                    fetch_model_zip_if_needed(url, MODEL_PATH, expected_sha256=(sha or None))
+                else:
+                    fetch_model_if_needed(url, MODEL_PATH, expected_sha256=(sha or None))
+            model_exists = os.path.exists(MODEL_PATH)
+            if model_exists:
+                st.sidebar.success(f"Remote model ready: {MODEL_PATH}")
+        except Exception as e:
+            model_exists = False
+            remote_loaded_error = str(e)
+            st.sidebar.error(f"Model download failed: {e}")
+
+elif model_choice == "Remote URL via Secrets (single)":
     url = st.secrets.get("model", {}).get("url")
     sha = st.secrets.get("model", {}).get("sha256")
     MODEL_PATH = os.path.join(MODELS_DIR, "remote_crnn.pt")
     try:
         if url:
-            fetch_model_if_needed(url, MODEL_PATH, expected_sha256=(sha or None))
+            if url.lower().endswith(".zip"):
+                fetch_model_zip_if_needed(url, MODEL_PATH, expected_sha256=(sha or None))
+            else:
+                fetch_model_if_needed(url, MODEL_PATH, expected_sha256=(sha or None))
         model_exists = os.path.exists(MODEL_PATH)
         if model_exists:
             st.sidebar.success("Remote model available.")
@@ -613,12 +663,15 @@ elif model_choice == "Remote URL via Secrets":
         st.sidebar.error(f"Model download failed: {e}")
 
 elif model_choice == "Paste a URL":
-    url = st.sidebar.text_input("Model URL (direct .pt)", "")
+    url = st.sidebar.text_input("Model URL (direct .pt or .zip)", "")
     sha = st.sidebar.text_input("Optional SHA256", "")
     MODEL_PATH = os.path.join(MODELS_DIR, "pasted_crnn.pt")
     if st.sidebar.button("Download model"):
         try:
-            fetch_model_if_needed(url, MODEL_PATH, expected_sha256=(sha or None))
+            if url.lower().endswith(".zip"):
+                fetch_model_zip_if_needed(url, MODEL_PATH, expected_sha256=(sha or None))
+            else:
+                fetch_model_if_needed(url, MODEL_PATH, expected_sha256=(sha or None))
             model_exists = True
             st.sidebar.success(f"Downloaded to {MODEL_PATH}")
         except Exception as e:
@@ -745,7 +798,7 @@ if imp_pat:
 def extract_text_tesseract_or_crnn(pil_image):
     """Run the selected OCR engine on a PIL image and return (raw_text, processed_img, cfg, boxes, overlay_img)."""
     if use_crnn and crnn_ready:
-        import torchvision.transforms as T
+        import torchvision.transforms as T, torch
         def recognize_line(img_pil):
             img = img_pil.convert("L")
             w, h = img.size
@@ -947,12 +1000,10 @@ with st.expander("Open Trainer", expanded=False):
                 st.error(proc.stderr or "Training failed.")
             else:
                 st.success(f"🎉 Training complete. Model saved as {DEFAULT_MODEL_FILENAME}")
-                # Offer download and copy to models/ too
                 try:
                     with open(DEFAULT_MODEL_FILENAME, "rb") as f:
                         st.download_button("⬇️ Download CRNN model", data=f.read(),
                                            file_name=os.path.basename(DEFAULT_MODEL_FILENAME), mime="application/octet-stream")
-                    # Also mirror into models/ to appear under "Local file(s)"
                     try:
                         shutil.copy2(DEFAULT_MODEL_FILENAME, os.path.join(MODELS_DIR, DEFAULT_MODEL_FILENAME))
                     except Exception:
@@ -985,4 +1036,4 @@ if st.sidebar.checkbox("Show Debug Info"):
     st.write("**Number of Results:**", len(st.session_state.ocr_results))
 
 st.markdown("---")
-st.markdown("*💡 Tip: Use **Local file(s) in repo** with Git LFS for persistent models, or **Remote URL via Secrets** to auto-download on startup.*")
+st.markdown("*💡 Tip: Use **Remote URLs via Secrets (multiple)** to switch between release models without re-uploading.*")
