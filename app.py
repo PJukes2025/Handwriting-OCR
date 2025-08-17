@@ -96,22 +96,53 @@ def ensure_data_dir():
             pass
 def cleanup_token(w: str) -> str:
     return w.strip().strip('.,;:!?()[]{}"\'“”’‘')
+    
 def rebuild_user_words():
-    """Build Tesseract user-words file from all corrected outputs."""
-    words = set()
-    for corr in st.session_state.corrections.values():
-        for w in corr["corrected"].split():
+    """
+    Build Tesseract user-words from whatever shape corrections are in.
+    Accepts:
+      - dict[str, dict{corrected: str, ...}]
+      - dict[str, str]
+      - list[dict{corrected: str, ...}]
+      - list[str]
+    Ignores anything malformed.
+    """
+    def add_from_text(t, acc):
+        if not isinstance(t, str):
+            return
+        for w in t.split():
             w2 = cleanup_token(w)
             if w2 and any(ch.isalpha() for ch in w2):
-                words.add(w2)
+                acc.add(w2)
+
+    words = set()
+    store = st.session_state.get("corrections", {})
+
+    if isinstance(store, dict):
+        for v in store.values():
+            if isinstance(v, dict):
+                add_from_text(v.get("corrected"), words)
+            elif isinstance(v, str):
+                add_from_text(v, words)
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        add_from_text(item.get("corrected"), words)
+                    elif isinstance(item, str):
+                        add_from_text(item, words)
+
+    elif isinstance(store, list):
+        for item in store:
+            if isinstance(item, dict):
+                add_from_text(item.get("corrected"), words)
+            elif isinstance(item, str):
+                add_from_text(item, words)
+
+    # write file (even if empty) so downstream flags don’t error
+    os.makedirs(DATA_DIR, exist_ok=True)
     with open(USER_WORDS_PATH, "w", encoding="utf-8") as f:
         f.write("\n".join(sorted(words)))
-def make_image_key(filename, image):
-    """Unique key per image (name + hash)."""
-    bio = io.BytesIO()
-    image.save(bio, format="PNG")
-    digest = hashlib.md5(bio.getvalue()).hexdigest()[:8]
-    return f"{filename}_{digest}"
+
 
 # ---- sanitize learned patterns to avoid 'count' errors ----
 def sanitize_learned_patterns():
