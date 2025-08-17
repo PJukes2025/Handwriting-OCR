@@ -1,5 +1,5 @@
 # app.py
-import os, io, json, time, tempfile, hashlib, platform, shutil, zipfile, subprocess, sys, textwrap, re, csv
+import os, io, json, time, tempfile, hashlib, platform, shutil, zipfile, subprocess, sys, textwrap, re, csv, glob, urllib.request
 from datetime import datetime
 
 import streamlit as st
@@ -38,10 +38,16 @@ _TESS_PATH = auto_configure_tesseract()
 
 # ========= Paths =========
 DATA_DIR         = "ocr_data"
+MODELS_DIR       = "models"  # new: central place for downloaded/pasted/uploaded models
+os.makedirs(MODELS_DIR, exist_ok=True)
+
 CORRECTIONS_PATH = os.path.join(DATA_DIR, "corrections.json")
 PATTERNS_PATH    = os.path.join(DATA_DIR, "learned_patterns.json")
 USER_WORDS_PATH  = os.path.join(DATA_DIR, "user_words.txt")
-MODEL_PATH       = "crnn_handwriting.pt"
+
+# Default model filename; may be replaced by sidebar selection
+DEFAULT_MODEL_FILENAME = "crnn_handwriting.pt"
+DEFAULT_MODEL_PATH = os.path.join(".", DEFAULT_MODEL_FILENAME)
 
 # ========= Robust JSON (“Jason”) layer =========
 SCHEMA_VERSION = 1
@@ -57,9 +63,8 @@ def _migrate(payload):
     data = payload.get("data", payload)
     return {"_meta": {"schema": SCHEMA_VERSION, "saved_at": _now_iso()}, "data": data}
 def _atomic_write(path, payload):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    dir_ = os.path.dirname(path) or "."
-    fd, tmp = tempfile.mkstemp(prefix=".tmp_", dir=dir_)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp_", dir=os.path.dirname(path) or ".")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -108,15 +113,8 @@ def make_image_key(filename, image):
     digest = hashlib.md5(bio.getvalue()).hexdigest()[:8]
     return f"{filename}_{digest}"
 
-# ---- NEW: sanitize learned patterns to avoid 'count' errors ----
+# ---- sanitize learned patterns to avoid 'count' errors ----
 def sanitize_learned_patterns():
-    """
-    Ensure every learned_patterns entry is a dict with:
-      - replacement: str
-      - count: int
-      - examples: list
-    Convert legacy string entries to dict. Drop invalid entries.
-    """
     lp = st.session_state.learned_patterns
     if not isinstance(lp, dict):
         st.session_state.learned_patterns = {}
@@ -135,13 +133,10 @@ def sanitize_learned_patterns():
             cleaned[k] = {"replacement": replacement, "count": max(0, count), "examples": examples}
         elif isinstance(v, str):
             cleaned[k] = {"replacement": v, "count": 1, "examples": []}
-        else:
-            # skip invalid
-            continue
+        # else drop invalid silently
     st.session_state.learned_patterns = cleaned
 
 def learn_from_correction(original, corrected):
-    """Simple word mapping learning."""
     if not original or not corrected or original == corrected:
         return
     orig_words, corr_words = original.split(), corrected.split()
@@ -156,7 +151,6 @@ def learn_from_correction(original, corrected):
                         "examples": [{"original": original, "corrected": corrected}],
                     }
                 else:
-                    # keep structure clean
                     entry["replacement"] = str(cw)
                     entry["count"] = int(entry.get("count", 0)) + 1
                     if isinstance(entry.get("examples"), list):
@@ -180,8 +174,6 @@ def apply_learned_corrections(text, image_key):
     if image_key in st.session_state.corrections:
         return st.session_state.corrections[image_key]["corrected"]
     corrected_text = text
-
-    # Built-in quick fixes
     built_in_fixes = {
         " or ": " a ",
         "rn": "m",
@@ -195,15 +187,11 @@ def apply_learned_corrections(text, image_key):
     }
     for a, b in built_in_fixes.items():
         corrected_text = corrected_text.replace(a, b)
-
-    # Apply learned patterns robustly (dict or legacy string entries)
     items = []
     for pat, info in st.session_state.learned_patterns.items():
         if isinstance(info, dict):
-            try:
-                cnt = int(info.get("count", 0))
-            except Exception:
-                cnt = 0
+            try: cnt = int(info.get("count", 0))
+            except Exception: cnt = 0
             repl = str(info.get("replacement", ""))
             items.append((pat, cnt, repl))
         elif isinstance(info, str):
@@ -211,47 +199,37 @@ def apply_learned_corrections(text, image_key):
     for pat, _, repl in sorted(items, key=lambda x: -x[1]):
         if pat and repl and pat in corrected_text:
             corrected_text = corrected_text.replace(pat, repl)
-
     return corrected_text
 
-# ========= Orientation helpers (updated) =========
+# ========= Orientation helpers =========
 def rotate_image(pil_img: Image.Image, mode: str) -> Image.Image:
-    """Rotate according to user selection."""
     if mode == "None":
         return pil_img
-
     if mode == "Auto (keep text horizontal)":
-        # 1) Try Tesseract OSD to get rotation suggestion
         try:
             osd = pytesseract.image_to_osd(pil_img)
             m = re.search(r"Rotate:\s+(\d+)", osd)
             if m:
                 angle = int(m.group(1)) % 360
-                # If text is vertical (90/270), rotate to nearest horizontal
                 if angle in (90, 270):
                     return pil_img.rotate(90 if angle == 90 else -90, expand=True)
                 elif angle == 180:
                     return pil_img.rotate(180, expand=True)
                 else:
-                    return pil_img  # already horizontal
+                    return pil_img
         except Exception:
             pass
-        # 2) Fallback: ensure width >= height
         if pil_img.width < pil_img.height:
             return pil_img.rotate(90, expand=True)
         return pil_img
-
     if mode == "90° CW":
         return pil_img.rotate(-90, expand=True)
     if mode == "90° CCW":
         return pil_img.rotate(90, expand=True)
     if mode == "180°":
         return pil_img.rotate(180, expand=True)
-
-    # Back-compat (old name)
     if mode == "Auto (landscape→portrait)":
         return pil_img.rotate(90, expand=True) if pil_img.width > pil_img.height else pil_img
-
     return pil_img
 
 # ========= Image preprocessing & OCR =========
@@ -299,20 +277,11 @@ def extract_text_tesseract(image, enhancement_level="medium"):
 
 # ========= Line segmentation with boxes (for previews) =========
 def segment_lines_with_boxes(pil_img, min_line_height=12, gap_thresh=6):
-    """
-    Returns:
-      crops: [PIL.Image], one per detected line (grayscale)
-      boxes: list of (x0, y0, x1, y1) in the coordinate system of pil_img
-    """
     img = np.array(pil_img.convert("L"))
     h, w = img.shape[:2]
-
-    # Robust binarization
     bw = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
                                cv2.THRESH_BINARY_INV, 25, 15)
     proj = bw.sum(axis=1)
-
-    # Find vertical runs with ink
     lines = []
     in_run = False
     start = 0
@@ -328,8 +297,6 @@ def segment_lines_with_boxes(pil_img, min_line_height=12, gap_thresh=6):
         end = h
         if end - start >= min_line_height:
             lines.append((start, end))
-
-    # Merge close lines
     merged = []
     for s, e in lines:
         if not merged: merged.append([s, e]); continue
@@ -338,16 +305,14 @@ def segment_lines_with_boxes(pil_img, min_line_height=12, gap_thresh=6):
             merged[-1][1] = e
         else:
             merged.append([s, e])
-
     crops, boxes = [], []
     for s, e in merged:
         pad = 3
         s2 = max(0, s - pad); e2 = min(h, e + pad)
         strip = img[s2:e2, :]
-        # compute left/right ink extent
         col_proj = (255 - strip).sum(axis=0)
         xs = np.where(col_proj > 0)[0]
-        if xs.size == 0:
+        if xs.size == 0: 
             continue
         x0, x1 = xs[0], xs[-1] + 1
         line = strip[:, x0:x1]
@@ -356,7 +321,6 @@ def segment_lines_with_boxes(pil_img, min_line_height=12, gap_thresh=6):
     return crops, boxes
 
 def draw_boxes_on_image(pil_img, boxes, width=3):
-    """Return a copy of pil_img with red rectangles drawn for each (x0,y0,x1,y1)."""
     overlay = pil_img.convert("RGB").copy()
     draw = ImageDraw.Draw(overlay)
     for (x0, y0, x1, y1) in boxes:
@@ -541,13 +505,42 @@ if "corrections" not in st.session_state:
 if "learned_patterns" not in st.session_state:
     st.session_state.learned_patterns, _ = load_json_versioned(PATTERNS_PATH, {})
 
-# NEW: sanitize legacy/bad patterns, persist, then rebuild words
 sanitize_learned_patterns()
 persist_all()
 rebuild_user_words()
 
+# ========= Model fetch helpers (persistent options) =========
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def fetch_model_if_needed(url, out_path, expected_sha256=None):
+    """
+    Download model from URL if out_path doesn't exist or hash mismatches.
+    Returns out_path on success.
+    """
+    need = True
+    if os.path.exists(out_path):
+        if expected_sha256:
+            need = (_sha256(out_path) != expected_sha256)
+        else:
+            need = False
+    if need:
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        tmp = out_path + ".tmp"
+        urllib.request.urlretrieve(url, tmp)  # direct download
+        if expected_sha256 and _sha256(tmp) != expected_sha256:
+            os.remove(tmp)
+            raise RuntimeError("Downloaded model hash mismatch")
+        os.replace(tmp, out_path)
+    return out_path
+
 # ========= Sidebar =========
 st.sidebar.header("Settings")
+
 # Tesseract status
 if _TESS_PATH:
     st.sidebar.caption(f"✅ Tesseract detected: {_TESS_PATH}")
@@ -561,25 +554,107 @@ else:
 
 enhancement_level = st.sidebar.selectbox("Enhancement Level", ["light","medium","aggressive"], index=1)
 
-# Orientation control (updated default)
 orientation_mode = st.sidebar.selectbox(
     "Orientation",
     ["Auto (keep text horizontal)", "None", "90° CW", "90° CCW", "180°"],
     index=0
 )
 
-# Show line boxes toggle
 show_line_boxes = st.sidebar.toggle("Show line boxes", value=True)
 
-# CRNN toggle appears only when model exists
-model_exists = os.path.exists(MODEL_PATH)
+# ===== NEW: Model source & persistence options =====
+st.sidebar.markdown("### Model source")
+model_choice = st.sidebar.selectbox(
+    "Load CRNN model from",
+    ["Local file(s) in repo", "Remote URL via Secrets", "Paste a URL", "Upload (ephemeral)"],
+    index=0
+)
+
+LOCAL_MODEL_CANDIDATES = []
+# include models/ and project root *.pt
+LOCAL_MODEL_CANDIDATES += sorted(glob.glob(os.path.join(MODELS_DIR, "*.pt")))
+LOCAL_MODEL_CANDIDATES += sorted(glob.glob("*.pt"))
+
+selected_local = None
+remote_loaded_error = None
+MODEL_PATH = DEFAULT_MODEL_PATH  # will be overwritten per choice
+model_exists = False
+
+if model_choice == "Local file(s) in repo":
+    if not LOCAL_MODEL_CANDIDATES and os.path.exists(DEFAULT_MODEL_PATH):
+        LOCAL_MODEL_CANDIDATES.append(DEFAULT_MODEL_PATH)
+    if LOCAL_MODEL_CANDIDATES:
+        selected_local = st.sidebar.selectbox("Select model", LOCAL_MODEL_CANDIDATES, index=0)
+        MODEL_PATH = selected_local
+        model_exists = os.path.exists(MODEL_PATH)
+        st.sidebar.caption(f"📦 Using model file: {MODEL_PATH}")
+        st.sidebar.caption("Tip: Commit *.pt with Git LFS so it persists across deploys.")
+    else:
+        st.sidebar.info("No .pt files found in repo. Add via Git LFS or use a remote URL.")
+        model_exists = False
+
+elif model_choice == "Remote URL via Secrets":
+    st.sidebar.caption("Define in Secrets (App → Settings → Secrets):")
+    st.sidebar.code('''[model]\nurl = "https://host/path/to/model.pt"\nsha256 = "optional_hex"''', language="toml")
+    url = st.secrets.get("model", {}).get("url")
+    sha = st.secrets.get("model", {}).get("sha256")
+    MODEL_PATH = os.path.join(MODELS_DIR, "remote_crnn.pt")
+    try:
+        if url:
+            fetch_model_if_needed(url, MODEL_PATH, expected_sha256=(sha or None))
+        model_exists = os.path.exists(MODEL_PATH)
+        if model_exists:
+            st.sidebar.success("Remote model available.")
+        else:
+            st.sidebar.info("Set secrets to auto-download the model.")
+    except Exception as e:
+        model_exists = False
+        remote_loaded_error = str(e)
+        st.sidebar.error(f"Model download failed: {e}")
+
+elif model_choice == "Paste a URL":
+    url = st.sidebar.text_input("Model URL (direct .pt)", "")
+    sha = st.sidebar.text_input("Optional SHA256", "")
+    MODEL_PATH = os.path.join(MODELS_DIR, "pasted_crnn.pt")
+    if st.sidebar.button("Download model"):
+        try:
+            fetch_model_if_needed(url, MODEL_PATH, expected_sha256=(sha or None))
+            model_exists = True
+            st.sidebar.success(f"Downloaded to {MODEL_PATH}")
+        except Exception as e:
+            model_exists = False
+            remote_loaded_error = str(e)
+            st.sidebar.error(f"Download failed: {e}")
+    else:
+        model_exists = os.path.exists(MODEL_PATH)
+        if model_exists:
+            st.sidebar.caption(f"Using previously downloaded: {MODEL_PATH}")
+
+else:  # Upload (ephemeral)
+    up = st.sidebar.file_uploader("Upload a .pt model (ephemeral)", type=["pt"], key="model_upload")
+    MODEL_PATH = os.path.join(MODELS_DIR, "uploaded_crnn.pt")
+    if up is not None:
+        try:
+            with open(MODEL_PATH, "wb") as f:
+                f.write(up.read())
+            model_exists = True
+            st.sidebar.success(f"Uploaded to {MODEL_PATH}")
+        except Exception as e:
+            model_exists = False
+            st.sidebar.error(f"Upload failed: {e}")
+    else:
+        model_exists = os.path.exists(MODEL_PATH)
+        if model_exists:
+            st.sidebar.caption(f"Using previously uploaded: {MODEL_PATH}")
+
+# Toggle appears only when a model exists
 if model_exists:
     use_crnn = st.sidebar.toggle("Use CRNN (experimental)", value=True)
 else:
     use_crnn = False
-    st.sidebar.info("No CRNN model found yet. Train one in the panel below, then toggle this on.")
+    st.sidebar.info("No CRNN model available. Select a source above.")
 
-# Load CRNN when needed
+# ========= Load CRNN if requested =========
 crnn_ready = False
 if use_crnn:
     try:
@@ -589,8 +664,8 @@ if use_crnn:
         mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
 
         @st.cache_resource
-        def load_crnn():
-            ckpt = torch.load(MODEL_PATH, map_location="cpu")
+        def load_crnn_model(model_path):
+            ckpt = torch.load(model_path, map_location="cpu")
             model = mod.CRNN()
             model.load_state_dict(ckpt["model"])
             model.eval()
@@ -598,33 +673,9 @@ if use_crnn:
             idx2char = {i+1: c for i, c in enumerate(charset)}
             return model, charset, idx2char
 
-        crnn_model, crnn_charset, crnn_idx2char = load_crnn()
+        crnn_model, crnn_charset, crnn_idx2char = load_crnn_model(MODEL_PATH)
         crnn_ready = True
-
-        def recognize_line(img_pil):
-            import torchvision.transforms as T
-            img = img_pil.convert("L")
-            w, h = img.size
-            img_h, max_w = 32, 512
-            new_w = int(w * (img_h / h))
-            img = img.resize((min(new_w, max_w), img_h))
-            if img.size[0] < max_w:
-                canvas = Image.new("L", (max_w, img_h), 255)
-                canvas.paste(img, (0, 0))
-                img = canvas
-            x = T.ToTensor()(img).unsqueeze(0)  # [1,1,H,W]
-            with torch.no_grad():
-                logits = crnn_model(x)           # [T,N,C]
-                best = logits.argmax(dim=2).permute(1,0)[0].tolist()
-            out, prev = [], -1
-            BLANK = 0
-            for t in best:
-                if t != prev and t != BLANK:
-                    out.append(crnn_idx2char.get(t, ""))
-                prev = t
-            return "".join(out)
-
-        st.sidebar.caption("🧠 CRNN model loaded.")
+        st.sidebar.caption(f"🧠 CRNN loaded from: {MODEL_PATH}")
     except Exception as e:
         st.sidebar.warning(f"CRNN unavailable: {e}")
         use_crnn = False
@@ -633,20 +684,17 @@ st.sidebar.markdown("### 🧠 Learning Status")
 st.sidebar.metric("Saved Corrections", len(st.session_state.corrections))
 st.sidebar.metric("Learned Patterns", len(st.session_state.learned_patterns))
 
-# Hardened "Top Learned Patterns" (tolerant to legacy entries)
+# Hardened "Top Learned Patterns"
 if st.session_state.learned_patterns:
     st.sidebar.markdown("**Top Learned Patterns:**")
     rows = []
     for pat, info in st.session_state.learned_patterns.items():
         if isinstance(info, dict):
-            try:
-                cnt = int(info.get("count", 0))
-            except Exception:
-                cnt = 0
+            try: cnt = int(info.get("count", 0))
+            except Exception: cnt = 0
             rep = str(info.get("replacement", ""))
         elif isinstance(info, str):
-            cnt = 1
-            rep = info
+            cnt = 1; rep = info
         else:
             continue
         rows.append((pat, cnt, rep))
@@ -697,12 +745,32 @@ if imp_pat:
 def extract_text_tesseract_or_crnn(pil_image):
     """Run the selected OCR engine on a PIL image and return (raw_text, processed_img, cfg, boxes, overlay_img)."""
     if use_crnn and crnn_ready:
+        import torchvision.transforms as T
+        def recognize_line(img_pil):
+            img = img_pil.convert("L")
+            w, h = img.size
+            img_h, max_w = 32, 512
+            new_w = int(w * (img_h / h))
+            img = img.resize((min(new_w, max_w), img_h))
+            if img.size[0] < max_w:
+                canvas = Image.new("L", (max_w, img_h), 255)
+                canvas.paste(img, (0, 0))
+                img = canvas
+            x = T.ToTensor()(img).unsqueeze(0)
+            with torch.no_grad():
+                logits = crnn_model(x)
+                best = logits.argmax(dim=2).permute(1,0)[0].tolist()
+            out, prev = [], -1
+            BLANK = 0
+            for t in best:
+                if t != prev and t != BLANK:
+                    out.append(crnn_idx2char.get(t, ""))
+                prev = t
+            return "".join(out)
+
         crops, boxes = segment_lines_with_boxes(pil_image)
         lines = crops or [pil_image]
-        recognized = []
-        for ln in lines:
-            txt = recognize_line(ln)
-            recognized.append(txt.strip())
+        recognized = [recognize_line(ln).strip() for ln in lines]
         raw_text = "\n".join([t for t in recognized if t])
         proc_img = preprocess_image(pil_image, enhancement_level)  # for display
         cfg = "crnn-lines"
@@ -714,7 +782,10 @@ def extract_text_tesseract_or_crnn(pil_image):
 
 # ========= Main =========
 st.title("📝 Journalist's OCR Tool")
-st.markdown("*Handwriting-first OCR — CRNN per-line + learned corrections; orientation keeps text horizontal. Line boxes preview enabled.*")
+engine_badge = "CRNN" if (use_crnn and crnn_ready) else "Tesseract"
+st.caption(f"Model status: **{engine_badge}**")
+
+st.markdown("*Handwriting-first OCR — CRNN per-line + learned corrections; orientation keeps text horizontal. Line boxes preview enabled. Persistent model loading via repo/URL.*")
 
 uploaded_files = st.file_uploader("Upload Images", type=["jpg","jpeg","png"], accept_multiple_files=True)
 if uploaded_files:
@@ -724,8 +795,8 @@ if uploaded_files:
         for i, uf in enumerate(uploaded_files):
             try:
                 image = Image.open(uf)
-                image = ImageOps.exif_transpose(image)         # respect camera EXIF
-                baseline = rotate_image(image, orientation_mode)  # apply global orientation
+                image = ImageOps.exif_transpose(image)
+                baseline = rotate_image(image, orientation_mode)
 
                 key = make_image_key(uf.name, baseline)
 
@@ -739,8 +810,8 @@ if uploaded_files:
                     "text": fixed,
                     "config": cfg,
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "baseline_image": baseline,   # for reset
-                    "image": baseline,            # current (rotatable) image
+                    "baseline_image": baseline,
+                    "image": baseline,
                     "processed_image": proc_img,
                     "line_boxes": boxes,
                     "overlay_image": overlay
@@ -750,31 +821,22 @@ if uploaded_files:
             progress.progress((i+1)/len(uploaded_files))
         st.success("✅ Processing complete!")
 
-# Results & learning (with per-image rotate controls + overlays)
+# Results & learning (rotate controls + overlays)
 if st.session_state.ocr_results:
     st.header("📋 Results & Learning")
     for i, r in enumerate(st.session_state.ocr_results):
         st.markdown("---")
         st.subheader(f"📄 {r['filename']}")
 
-        # Per-image rotate controls
         bcol1, bcol2, bcol3, bcol4, bcol5 = st.columns([1,1,1,1,3])
         with bcol1:
             if st.button("↩︎ 90° CCW", key=f"rot_ccw_{i}"):
                 try:
                     new_img = r["image"].rotate(90, expand=True)
                     raw_text, proc_img, cfg, boxes, overlay = extract_text_tesseract_or_crnn(new_img)
-                    r.update({
-                        "image": new_img,
-                        "original_text": raw_text,
-                        "text": apply_learned_corrections(raw_text, r["image_key"]),
-                        "config": cfg,
-                        "processed_image": proc_img,
-                        "line_boxes": boxes,
-                        "overlay_image": overlay
-                    })
-                    st.session_state.ocr_results[i] = r
-                    st.rerun()
+                    r.update({"image": new_img, "original_text": raw_text, "text": apply_learned_corrections(raw_text, r["image_key"]),
+                              "config": cfg, "processed_image": proc_img, "line_boxes": boxes, "overlay_image": overlay})
+                    st.session_state.ocr_results[i] = r; st.rerun()
                 except Exception as e:
                     st.error(f"Rotate CCW failed: {e}")
         with bcol2:
@@ -782,17 +844,9 @@ if st.session_state.ocr_results:
                 try:
                     new_img = r["image"].rotate(-90, expand=True)
                     raw_text, proc_img, cfg, boxes, overlay = extract_text_tesseract_or_crnn(new_img)
-                    r.update({
-                        "image": new_img,
-                        "original_text": raw_text,
-                        "text": apply_learned_corrections(raw_text, r["image_key"]),
-                        "config": cfg,
-                        "processed_image": proc_img,
-                        "line_boxes": boxes,
-                        "overlay_image": overlay
-                    })
-                    st.session_state.ocr_results[i] = r
-                    st.rerun()
+                    r.update({"image": new_img, "original_text": raw_text, "text": apply_learned_corrections(raw_text, r["image_key"]),
+                              "config": cfg, "processed_image": proc_img, "line_boxes": boxes, "overlay_image": overlay})
+                    st.session_state.ocr_results[i] = r; st.rerun()
                 except Exception as e:
                     st.error(f"Rotate CW failed: {e}")
         with bcol3:
@@ -800,17 +854,9 @@ if st.session_state.ocr_results:
                 try:
                     new_img = r["image"].rotate(180, expand=True)
                     raw_text, proc_img, cfg, boxes, overlay = extract_text_tesseract_or_crnn(new_img)
-                    r.update({
-                        "image": new_img,
-                        "original_text": raw_text,
-                        "text": apply_learned_corrections(raw_text, r["image_key"]),
-                        "config": cfg,
-                        "processed_image": proc_img,
-                        "line_boxes": boxes,
-                        "overlay_image": overlay
-                    })
-                    st.session_state.ocr_results[i] = r
-                    st.rerun()
+                    r.update({"image": new_img, "original_text": raw_text, "text": apply_learned_corrections(raw_text, r["image_key"]),
+                              "config": cfg, "processed_image": proc_img, "line_boxes": boxes, "overlay_image": overlay})
+                    st.session_state.ocr_results[i] = r; st.rerun()
                 except Exception as e:
                     st.error(f"Rotate 180 failed: {e}")
         with bcol4:
@@ -818,23 +864,14 @@ if st.session_state.ocr_results:
                 try:
                     new_img = rotate_image(r["baseline_image"], "Auto (keep text horizontal)")
                     raw_text, proc_img, cfg, boxes, overlay = extract_text_tesseract_or_crnn(new_img)
-                    r.update({
-                        "image": new_img,
-                        "original_text": raw_text,
-                        "text": apply_learned_corrections(raw_text, r["image_key"]),
-                        "config": cfg,
-                        "processed_image": proc_img,
-                        "line_boxes": boxes,
-                        "overlay_image": overlay
-                    })
-                    st.session_state.ocr_results[i] = r
-                    st.rerun()
+                    r.update({"image": new_img, "original_text": raw_text, "text": apply_learned_corrections(raw_text, r["image_key"]),
+                              "config": cfg, "processed_image": proc_img, "line_boxes": boxes, "overlay_image": overlay})
+                    st.session_state.ocr_results[i] = r; st.rerun()
                 except Exception as e:
                     st.error(f"Reset failed: {e}")
         with bcol5:
             st.caption("Rotate this image and re-run OCR instantly.")
 
-        # Display with overlay option
         col1, col2 = st.columns([1, 2])
         with col1:
             if show_line_boxes and r.get("overlay_image") is not None:
@@ -864,7 +901,7 @@ if st.session_state.ocr_results:
                        file_name=f"ocr_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
                        mime="text/plain")
 
-# ========= In-App CRNN Trainer (no terminal) =========
+# ========= In-App CRNN Trainer =========
 st.markdown("## 🧪 Experimental: In-App CRNN Trainer")
 with st.expander("Open Trainer", expanded=False):
     st.write("Upload a **ZIP** containing `dataset/train/images`, `dataset/train/labels.csv`, "
@@ -881,7 +918,6 @@ with st.expander("Open Trainer", expanded=False):
             with zipfile.ZipFile(z) as zf:
                 zf.extractall("./")
             st.success("✅ Dataset extracted to ./dataset/")
-            # quick structure check
             missing = []
             for path in ["dataset/train/images", "dataset/train/labels.csv",
                          "dataset/val/images",   "dataset/val/labels.csv"]:
@@ -902,7 +938,7 @@ with st.expander("Open Trainer", expanded=False):
                 "--epochs", str(int(epochs)),
                 "--batch", str(int(batch)),
                 "--lr", str(float(lr)),
-                "--out", MODEL_PATH,
+                "--out", DEFAULT_MODEL_FILENAME,  # save in repo root for LFS if desired
             ]
             st.write("Running:", " ".join(cmd))
             proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -910,11 +946,17 @@ with st.expander("Open Trainer", expanded=False):
             if proc.returncode != 0:
                 st.error(proc.stderr or "Training failed.")
             else:
-                st.success(f"🎉 Training complete. Model saved as {MODEL_PATH}")
+                st.success(f"🎉 Training complete. Model saved as {DEFAULT_MODEL_FILENAME}")
+                # Offer download and copy to models/ too
                 try:
-                    with open(MODEL_PATH, "rb") as f:
+                    with open(DEFAULT_MODEL_FILENAME, "rb") as f:
                         st.download_button("⬇️ Download CRNN model", data=f.read(),
-                                           file_name=os.path.basename(MODEL_PATH), mime="application/octet-stream")
+                                           file_name=os.path.basename(DEFAULT_MODEL_FILENAME), mime="application/octet-stream")
+                    # Also mirror into models/ to appear under "Local file(s)"
+                    try:
+                        shutil.copy2(DEFAULT_MODEL_FILENAME, os.path.join(MODELS_DIR, DEFAULT_MODEL_FILENAME))
+                    except Exception:
+                        pass
                 except Exception:
                     pass
         except Exception as e:
@@ -943,4 +985,4 @@ if st.sidebar.checkbox("Show Debug Info"):
     st.write("**Number of Results:**", len(st.session_state.ocr_results))
 
 st.markdown("---")
-st.markdown("*💡 Tip: Toggle 'Show line boxes' to visualize what the model will read. Use per-image rotate buttons for quick fixes, then save corrections to keep improving results.*")
+st.markdown("*💡 Tip: Use **Local file(s) in repo** with Git LFS for persistent models, or **Remote URL via Secrets** to auto-download on startup.*")
