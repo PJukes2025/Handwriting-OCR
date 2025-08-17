@@ -1,5 +1,5 @@
 # app.py
-import os, io, json, time, tempfile, hashlib, platform, shutil, zipfile, subprocess, sys, textwrap, re, csv, glob, urllib.request
+import os, io, json, time, tempfile, hashlib, platform, shutil, zipfile, subprocess, sys, textwrap, re, csv, glob, urllib.request, contextlib
 from datetime import datetime
 
 import streamlit as st
@@ -94,18 +94,18 @@ def ensure_data_dir():
     if not os.path.exists(USER_WORDS_PATH):
         with open(USER_WORDS_PATH, "w", encoding="utf-8") as f:
             pass
+
 def cleanup_token(w: str) -> str:
     return w.strip().strip('.,;:!?()[]{}"\'“”’‘')
-    
+
+# *** FIX 1: robust rebuild_user_words (never crashes on bad entries) ***
 def rebuild_user_words():
     """
-    Build Tesseract user-words from whatever shape corrections are in.
-    Accepts:
+    Build Tesseract user-words from corrections (very tolerant to structure):
       - dict[str, dict{corrected: str, ...}]
       - dict[str, str]
       - list[dict{corrected: str, ...}]
       - list[str]
-    Ignores anything malformed.
     """
     def add_from_text(t, acc):
         if not isinstance(t, str):
@@ -138,13 +138,18 @@ def rebuild_user_words():
             elif isinstance(item, str):
                 add_from_text(item, words)
 
-    # write file (even if empty) so downstream flags don’t error
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(USER_WORDS_PATH, "w", encoding="utf-8") as f:
         f.write("\n".join(sorted(words)))
 
+def make_image_key(filename, image):
+    """Unique key per image (name + hash)."""
+    bio = io.BytesIO()
+    image.save(bio, format="PNG")
+    digest = hashlib.md5(bio.getvalue()).hexdigest()[:8]
+    return f"{filename}_{digest}"
 
-# ---- sanitize learned patterns to avoid 'count' errors ----
+# sanitize learned patterns
 def sanitize_learned_patterns():
     lp = st.session_state.learned_patterns
     if not isinstance(lp, dict):
@@ -202,7 +207,7 @@ def save_correction(image_key, original_text, corrected_text):
 
 def apply_learned_corrections(text, image_key):
     if image_key in st.session_state.corrections:
-        return st.session_state.corrections[image_key]["corrected"]
+        return st.session_state.corrections[image_key].get("corrected", text)
     corrected_text = text
     built_in_fixes = {
         " or ": " a ",
@@ -537,7 +542,6 @@ if "learned_patterns" not in st.session_state:
 
 sanitize_learned_patterns()
 persist_all()
-rebuild_user_words()
 
 # ========= Model fetch helpers (persistent options) =========
 def _sha256(path):
@@ -547,10 +551,9 @@ def _sha256(path):
             h.update(chunk)
     return h.hexdigest()
 
-def fetch_model_if_needed(url, out_path, expected_sha256=None):
+def fetch_model_if_needed(url, out_path, expected_sha256=None, github_token=None):
     """
-    Download model from URL if out_path doesn't exist or hash mismatches.
-    Returns out_path on success.
+    Download model if missing or hash mismatch. Supports private GitHub releases via token.
     """
     need = True
     if os.path.exists(out_path):
@@ -558,27 +561,45 @@ def fetch_model_if_needed(url, out_path, expected_sha256=None):
             need = (_sha256(out_path) != expected_sha256)
         else:
             need = False
-    if need:
-        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-        tmp = out_path + ".tmp"
-        urllib.request.urlretrieve(url, tmp)
-        if expected_sha256 and _sha256(tmp) != expected_sha256:
-            os.remove(tmp)
-            raise RuntimeError("Downloaded model hash mismatch")
-        os.replace(tmp, out_path)
+    if not need:
+        return out_path
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    tmp = out_path + ".tmp"
+
+    req = urllib.request.Request(url)
+    if github_token:
+        req.add_header("Authorization", f"token {github_token}")
+        req.add_header("Accept", "application/octet-stream")
+
+    with contextlib.closing(urllib.request.urlopen(req)) as resp, open(tmp, "wb") as f:
+        f.write(resp.read())
+
+    if expected_sha256 and _sha256(tmp) != expected_sha256:
+        os.remove(tmp)
+        raise RuntimeError("Downloaded model hash mismatch")
+    os.replace(tmp, out_path)
     return out_path
 
-def fetch_model_zip_if_needed(url, out_path, expected_sha256=None):
+def fetch_model_zip_if_needed(url, out_path, expected_sha256=None, github_token=None):
     """
     Download a ZIP containing a .pt and extract the first .pt to out_path.
     """
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     tmp_zip = out_path + ".zip.tmp"
-    urllib.request.urlretrieve(url, tmp_zip)
-    if expected_sha256:
-        if _sha256(tmp_zip) != expected_sha256:
-            os.remove(tmp_zip)
-            raise RuntimeError("Downloaded ZIP hash mismatch")
+
+    req = urllib.request.Request(url)
+    if github_token:
+        req.add_header("Authorization", f"token {github_token}")
+        req.add_header("Accept", "application/octet-stream")
+
+    with contextlib.closing(urllib.request.urlopen(req)) as resp, open(tmp_zip, "wb") as f:
+        f.write(resp.read())
+
+    if expected_sha256 and _sha256(tmp_zip) != expected_sha256:
+        os.remove(tmp_zip)
+        raise RuntimeError("Downloaded ZIP hash mismatch")
+
     with zipfile.ZipFile(tmp_zip) as zf:
         pt_members = [m for m in zf.namelist() if m.lower().endswith(".pt")]
         if not pt_members:
@@ -621,7 +642,7 @@ st.sidebar.markdown("### Model source")
 model_choice = st.sidebar.selectbox(
     "Load CRNN model from",
     ["Local file(s) in repo", "Remote URLs via Secrets (multiple)", "Remote URL via Secrets (single)", "Paste a URL", "Upload (ephemeral)"],
-    index=1  # default to Secrets multiple for your case
+    index=1
 )
 
 LOCAL_MODEL_CANDIDATES = []
@@ -629,6 +650,7 @@ LOCAL_MODEL_CANDIDATES += sorted(glob.glob(os.path.join(MODELS_DIR, "*.pt")))
 LOCAL_MODEL_CANDIDATES += sorted(glob.glob("*.pt"))
 
 MODEL_PATH = DEFAULT_MODEL_PATH
+MODEL_PATHS = []
 model_exists = False
 remote_loaded_error = None
 
@@ -648,26 +670,28 @@ if model_choice == "Local file(s) in repo":
 elif model_choice == "Remote URLs via Secrets (multiple)":
     models_map = st.secrets.get("models", {})
     shas_map   = st.secrets.get("models_sha256", {})
+    gh_token   = st.secrets.get("github", {}).get("token") if isinstance(st.secrets.get("github", {}), dict) else None
+
     if not models_map:
         st.sidebar.info("Define in Secrets:\n\n[models]\nname1=\"https://...pt\"\nname2=\"https://...pt\"")
         model_exists = False
     else:
-        key = st.sidebar.selectbox("Select model", sorted(models_map.keys()))
-        url = models_map.get(key, "")
-        sha = None
-        # allow matching checksum by same key if provided
-        if isinstance(shas_map, dict):
-            sha = shas_map.get(key)
-        MODEL_PATH = os.path.join(MODELS_DIR, f"{key}.pt")
+        keys = st.sidebar.multiselect("Select model(s)", sorted(models_map.keys()),
+                                      default=[sorted(models_map.keys())[0]])
         try:
-            if url:
-                if url.lower().endswith(".zip"):
-                    fetch_model_zip_if_needed(url, MODEL_PATH, expected_sha256=(sha or None))
-                else:
-                    fetch_model_if_needed(url, MODEL_PATH, expected_sha256=(sha or None))
-            model_exists = os.path.exists(MODEL_PATH)
+            for key in keys:
+                url = models_map.get(key, "")
+                sha = (shas_map or {}).get(key)
+                path = os.path.join(MODELS_DIR, f"{key}.pt")
+                if url:
+                    if url.lower().endswith(".zip"):
+                        fetch_model_zip_if_needed(url, path, expected_sha256=(sha or None), github_token=gh_token)
+                    else:
+                        fetch_model_if_needed(url, path, expected_sha256=(sha or None), github_token=gh_token)
+                    MODEL_PATHS.append(path)
+            model_exists = len(MODEL_PATHS) > 0
             if model_exists:
-                st.sidebar.success(f"Remote model ready: {MODEL_PATH}")
+                st.sidebar.success(f"Loaded {len(MODEL_PATHS)} model file(s).")
         except Exception as e:
             model_exists = False
             remote_loaded_error = str(e)
@@ -676,13 +700,14 @@ elif model_choice == "Remote URLs via Secrets (multiple)":
 elif model_choice == "Remote URL via Secrets (single)":
     url = st.secrets.get("model", {}).get("url")
     sha = st.secrets.get("model", {}).get("sha256")
+    gh_token = st.secrets.get("github", {}).get("token") if isinstance(st.secrets.get("github", {}), dict) else None
     MODEL_PATH = os.path.join(MODELS_DIR, "remote_crnn.pt")
     try:
         if url:
             if url.lower().endswith(".zip"):
-                fetch_model_zip_if_needed(url, MODEL_PATH, expected_sha256=(sha or None))
+                fetch_model_zip_if_needed(url, MODEL_PATH, expected_sha256=(sha or None), github_token=gh_token)
             else:
-                fetch_model_if_needed(url, MODEL_PATH, expected_sha256=(sha or None))
+                fetch_model_if_needed(url, MODEL_PATH, expected_sha256=(sha or None), github_token=gh_token)
         model_exists = os.path.exists(MODEL_PATH)
         if model_exists:
             st.sidebar.success("Remote model available.")
@@ -696,13 +721,14 @@ elif model_choice == "Remote URL via Secrets (single)":
 elif model_choice == "Paste a URL":
     url = st.sidebar.text_input("Model URL (direct .pt or .zip)", "")
     sha = st.sidebar.text_input("Optional SHA256", "")
+    token = st.sidebar.text_input("Optional GitHub token (for private releases)", type="password")
     MODEL_PATH = os.path.join(MODELS_DIR, "pasted_crnn.pt")
     if st.sidebar.button("Download model"):
         try:
             if url.lower().endswith(".zip"):
-                fetch_model_zip_if_needed(url, MODEL_PATH, expected_sha256=(sha or None))
+                fetch_model_zip_if_needed(url, MODEL_PATH, expected_sha256=(sha or None), github_token=(token or None))
             else:
-                fetch_model_if_needed(url, MODEL_PATH, expected_sha256=(sha or None))
+                fetch_model_if_needed(url, MODEL_PATH, expected_sha256=(sha or None), github_token=(token or None))
             model_exists = True
             st.sidebar.success(f"Downloaded to {MODEL_PATH}")
         except Exception as e:
@@ -732,13 +758,12 @@ else:  # Upload (ephemeral)
             st.sidebar.caption(f"Using previously uploaded: {MODEL_PATH}")
 
 # Toggle appears only when a model exists
-if model_exists:
-    use_crnn = st.sidebar.toggle("Use CRNN (experimental)", value=True)
+if model_choice == "Remote URLs via Secrets (multiple)":
+    use_crnn = st.sidebar.toggle("Use CRNN (experimental)", value=True) if model_exists else False
 else:
-    use_crnn = False
-    st.sidebar.info("No CRNN model available. Select a source above.")
+    use_crnn = st.sidebar.toggle("Use CRNN (experimental)", value=True) if model_exists else False
 
-# ========= Load CRNN if requested =========
+# ========= Load CRNN (single or ensemble) =========
 crnn_ready = False
 if use_crnn:
     try:
@@ -748,18 +773,29 @@ if use_crnn:
         mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
 
         @st.cache_resource
-        def load_crnn_model(model_path):
-            ckpt = torch.load(model_path, map_location="cpu")
-            model = mod.CRNN()
-            model.load_state_dict(ckpt["model"])
-            model.eval()
-            charset = ckpt.get("charset", getattr(mod, "CHARS", ""))
-            idx2char = {i+1: c for i, c in enumerate(charset)}
-            return model, charset, idx2char
+        def load_crnn_models(paths):
+            models = []
+            common_idx2char = None
+            for p in paths:
+                ckpt = torch.load(p, map_location="cpu")
+                m = mod.CRNN()
+                m.load_state_dict(ckpt["model"]); m.eval()
+                charset = ckpt.get("charset", getattr(mod, "CHARS", ""))
+                idx2char = {i+1: c for i, c in enumerate(charset)}
+                if common_idx2char is None:
+                    common_idx2char = idx2char
+                else:
+                    if "".join(common_idx2char.values()) != "".join(idx2char.values()):
+                        raise RuntimeError("Ensemble models must share the same charset")
+                models.append(m)
+            return models, common_idx2char
 
-        crnn_model, crnn_charset, crnn_idx2char = load_crnn_model(MODEL_PATH)
+        if model_choice == "Remote URLs via Secrets (multiple)" and MODEL_PATHS:
+            crnn_models, crnn_idx2char = load_crnn_models(MODEL_PATHS)
+        else:
+            crnn_models, crnn_idx2char = load_crnn_models([MODEL_PATH])
         crnn_ready = True
-        st.sidebar.caption(f"🧠 CRNN loaded from: {MODEL_PATH}")
+        st.sidebar.caption(f"🧠 CRNN loaded ({len(crnn_models)} model(s)).")
     except Exception as e:
         st.sidebar.warning(f"CRNN unavailable: {e}")
         use_crnn = False
@@ -789,6 +825,33 @@ if st.sidebar.button("💾 Save All Now"):
     persist_all()
     st.sidebar.success("Saved to ocr_data/")
 
+# Normalizer for imported corrections
+def _normalize_corrections(data):
+    """
+    Return a dict mapping image_key -> {original, corrected, timestamp, ...}.
+    Accept list-of-rows, dict-of-rows, or plain strings.
+    """
+    if isinstance(data, dict):
+        out = {}
+        for k, v in data.items():
+            if isinstance(v, dict) and isinstance(v.get("corrected"), str):
+                out[str(k)] = v
+            elif isinstance(v, str):
+                out[str(k)] = {"original": "", "corrected": v, "timestamp": _now_iso()}
+        return out
+
+    if isinstance(data, list):
+        out = {}
+        for i, item in enumerate(data):
+            key = (item.get("image_key") if isinstance(item, dict) else None) or f"import_{i}"
+            if isinstance(item, dict) and isinstance(item.get("corrected"), str):
+                out[key] = item
+            elif isinstance(item, str):
+                out[key] = {"original": "", "corrected": item, "timestamp": _now_iso()}
+        return out
+
+    return {}
+
 st.sidebar.markdown("### Export / Import")
 st.sidebar.download_button(
     "⬇️ corrections.json",
@@ -807,7 +870,8 @@ if imp_corr:
     try:
         payload = json.load(imp_corr)
         data, _ = _unwrap(payload, {})
-        st.session_state.corrections = data
+        st.session_state.corrections = _normalize_corrections(data)
+        sanitize_learned_patterns()
         persist_all()
         st.sidebar.success("Corrections restored.")
     except Exception as e:
@@ -818,7 +882,7 @@ if imp_pat:
     try:
         payload = json.load(imp_pat)
         data, _ = _unwrap(payload, {})
-        st.session_state.learned_patterns = data
+        st.session_state.learned_patterns = data if isinstance(data, dict) else {}
         sanitize_learned_patterns()
         persist_all()
         st.sidebar.success("Patterns restored.")
@@ -830,6 +894,7 @@ def extract_text_tesseract_or_crnn(pil_image):
     """Run the selected OCR engine on a PIL image and return (raw_text, processed_img, cfg, boxes, overlay_img)."""
     if use_crnn and crnn_ready:
         import torchvision.transforms as T, torch
+
         def recognize_line(img_pil):
             img = img_pil.convert("L")
             w, h = img.size
@@ -841,9 +906,14 @@ def extract_text_tesseract_or_crnn(pil_image):
                 canvas.paste(img, (0, 0))
                 img = canvas
             x = T.ToTensor()(img).unsqueeze(0)
+
             with torch.no_grad():
-                logits = crnn_model(x)
-                best = logits.argmax(dim=2).permute(1,0)[0].tolist()
+                logits_sum = None
+                for m in crnn_models:
+                    logits = m(x)  # [T,N,C]
+                    logits_sum = logits if logits_sum is None else logits_sum + logits
+                best = logits_sum.argmax(dim=2).permute(1,0)[0].tolist()
+
             out, prev = [], -1
             BLANK = 0
             for t in best:
@@ -1045,17 +1115,29 @@ with st.expander("Open Trainer", expanded=False):
             st.error(f"Training error: {e}")
             st.info("Tip: Ensure `torch` and `torchvision` are installed in this environment.")
 
-# Corrections manager
+# Corrections manager (*** FIX 2: safe display ***)
 if st.session_state.corrections:
     st.header("🛠️ Saved Corrections")
     for k, c in st.session_state.corrections.items():
         with st.expander(f"Correction: {k}"):
             col1, col2 = st.columns(2)
-            with col1: st.write("**Original:**");  st.code(c["original"])
-            with col2: st.write("**Corrected:**"); st.code(c["corrected"])
-            st.caption(f"Saved: {c['timestamp']}")
+            orig = c.get("original", "")
+            corr = c.get("corrected", "")
+            # Make sure they're strings to avoid display errors
+            orig_s = str(orig) if not isinstance(orig, str) else orig
+            corr_s = str(corr) if not isinstance(corr, str) else corr
+            with col1:
+                st.write("**Original:**")
+                st.code(orig_s)
+            with col2:
+                st.write("**Corrected:**")
+                st.code(corr_s)
+            st.caption(f"Saved: {c.get('timestamp', '')}")
             if st.button("🗑️ Delete", key=f"del_{k}"):
-                del st.session_state.corrections[k]
+                try:
+                    del st.session_state.corrections[k]
+                except Exception:
+                    pass
                 persist_all()
                 st.rerun()
 
@@ -1067,4 +1149,4 @@ if st.sidebar.checkbox("Show Debug Info"):
     st.write("**Number of Results:**", len(st.session_state.ocr_results))
 
 st.markdown("---")
-st.markdown("*💡 Tip: Use **Remote URLs via Secrets (multiple)** to switch between release models without re-uploading.*")
+st.markdown("*💡 Tip: Use **Remote URLs via Secrets (multiple)** to switch or even ensemble multiple release models. Import your old corrections safely—this build normalizes and guards against missing fields.*")
